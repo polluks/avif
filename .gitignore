@@ -1,0 +1,11 @@
+# reggae plugin build artifacts
+*.o
+*.db
+a.out
+*.lha
+recognize
+recognize.db
+avif_decoder/libdav1d.a
+avif_decoder/dav1d/libdav1d.a
+avif_decoder/dav1d/build/
+.dtcode.blob
