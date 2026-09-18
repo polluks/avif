@@ -52,5 +52,5 @@ $(BLOB).o: data.c avif.decoder.h
 
 #===============================================================================
 
-avif.decoder.o: avif.decoder.c avif.decoder.h ../avif.demuxer.h class_version.h $(DAV1D_AR)
+avif.decoder.o: avif.decoder.c avif.decoder.h ../avif_demuxer/avif.demuxer.h class_version.h $(DAV1D_AR)
 	$(CC) $(CFLAGS) -I$(DAV1D) -I$(DAV1D)/include -c $<

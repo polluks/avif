@@ -45,7 +45,7 @@
 #include <classes/multimedia/video.h>
 
 #include <dav1d/dav1d.h>
-#include "../avif.demuxer.h"
+#include "../avif_demuxer/avif.demuxer.h"
 
 ///
 /// basic defs

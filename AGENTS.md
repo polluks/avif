@@ -6,10 +6,10 @@ Add AV1 Image File Format (AVIF, `avif.demuxer` + `avif.decoder`) support to
 MorphOS/Reggae as a pair of classic two-port multimedia plugins, modeled on the
 official `example/deep_demuxer/` + `example/deep_decoder/` skeletons:
 
-- `avif.demuxer` - parses the AVIF / ISO BMFF container, exposes image info
+- `avif.demuxer` (`avif_demuxer/`) - parses the AVIF / ISO BMFF container, exposes image info
   (width, height, bit depth, alpha, metadata) and emits the AV1 elementary
   stream to the output port.
-- `avif.decoder` - consumes the AV1 elementary stream and decodes it to the
+- `avif.decoder` (`avif_decoder/`) - consumes the AV1 elementary stream and decodes it to the
   Reggae common video format `MMFC_VIDEO_ARGB32` using a bundled, vendored
   copy of the open-source AV1 decoder **dav1d**.
 
@@ -170,14 +170,16 @@ premultiplied); single-plane AVIF only. Attributes on Get/GetPort:
 
 ## Build notes
 
-- avif.demuxer: files `avif.demuxer.c`, `avif.demuxer.h`, `class_version.h`,
-  `recognize.c`, `Makefile` (ppc-morphos-gcc cross build).
-- avif.decoder: `avif.decoder.c`, `avif.decoder.h`, `class_version.h`,
-  `data.c`, `Makefile`, plus `dav1d/` (vendored sources, BSD-2 licence
-  COPYING, hand-written config), built as a static archive `libdav1d.a` and
-  linked into the plugin. Host verification via stub headers under
-  `/tmp/opencode/medhdr/` (as used by octamed) + an integration test that
-  parses a tiny AVIF and decodes its frames.
+- avif.demuxer: files `avif_demuxer/avif.demuxer.c`, `avif.demuxer.h`,
+  `class_version.h`, `recognize.c`, `Makefile` (ppc-morphos-gcc cross build).
+- avif.decoder: files `avif_decoder/avif.decoder.c`, `avif.decoder.h`,
+  `class_version.h`, `data.c`, `Makefile`, plus `avif_decoder/dav1d/`
+  (vendored sources, BSD-2 licence COPYING, hand-written config), built as a
+  static archive `libdav1d.a` and linked into the plugin. Host verification
+  via stub headers under `/tmp/opencode/medhdr/` (as used by octamed) + an
+  integration test that parses a tiny AVIF and decodes its frames.
+  A copy of the demuxer's public header `avif.demuxer.h` is shared through
+  `../avif_demuxer/avif.demuxer.h`.
 
 ## Work state / next steps
 
