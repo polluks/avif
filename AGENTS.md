@@ -186,9 +186,14 @@ premultiplied); single-plane AVIF only. Attributes on Get/GetPort:
 - [x] Confirm scope: demuxer (box parse + AV1 emit) + decoder (bundled dav1d
       → ARGB32)
 - [x] Document conventions, formats, and AVIF/ISOBMFF parse rules in this file
-- [ ] Write `avif.demuxer.c` (+ header, recognize.c, class_version.h, Makefile)
-- [ ] Vendor dav1d 1.5.4 sources; trim to scalar C + hand-written config
-- [ ] Write `avif.decoder.c` (skeleton + dav1d glue + YUV→ARGB32 + alpha)
-- [ ] Host integration test (stub SDK headers, small generated AVIF), repro
+- [x] Write `avif.demuxer.c` (+ header, recognize.c, class_version.h, Makefile)
+      under `avif_demuxer/`
+- [x] Vendor dav1d sources; trim to scalar C + hand-written config under
+      `avif_decoder/dav1d/`
+- [x] Write `avif.decoder.c` (skeleton + dav1d glue + YUV→ARGB32 + alpha)
+      under `avif_decoder/`
+- [x] Host integration test (stub SDK headers, small generated AVIF), repro
       any parser/colour bugs
+- [x] Push both plugins to GitHub as the `avif` repo (polluks/avif,
+      `avif_demuxer/` + `avif_decoder/`)
 - [ ] Verify on real MorphOS hardware (needs ppc-morphos-gcc + Reggae SDK)

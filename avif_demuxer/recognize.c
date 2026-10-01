@@ -2,6 +2,7 @@
 
 #define SYSTEM_PRIVATE
 
+#include <string.h>
 #include <proto/intuition.h>
 #include <proto/multimedia.h>
 #include <clib/alib_protos.h>
@@ -23,34 +24,60 @@ const struct TagItem* ClassAttributes(void)
 	return ClassTags;
 }
 
+/* Brands we accept.  A file is recognised when its major brand is one of
+ * these, or when any of its compatible brands is one of these.  The second
+ * case matters because encoders may use a generic major brand such as 'mif1'
+ * and only list 'avif' in the compatible brands. */
+
+static BOOL brand_is_avif(const UBYTE *brand)
+{
+	return !memcmp(brand, "avif", 4) || !memcmp(brand, "avis", 4) ||
+	       !memcmp(brand, "avio", 4) || !memcmp(brand, "mif1", 4);
+}
+
 ULONG Recognize(struct DtCodeContext *dcc, ULONG recog_type)
 {
-	struct Library *IntuitionBase = dcc->dcc_IntuitionBase;
-	struct Library *MultimediaBase = dcc->dcc_MultimediaBase;
 	LONG probability = 0;
-	UBYTE header[12];
+	UBYTE header[64];
+	ULONG bytes_read;
 
-	if (DoMethod(dcc->dcc_Source, MMM_Peek, dcc->dcc_Port, (ULONG)header, 12) == 12)
+	bytes_read = DoMethod(dcc->dcc_Source, MMM_Peek, dcc->dcc_Port,
+	                      (ULONG)header, sizeof(header));
+
 	{
-		/* Check for 'ftyp' box header: size + "ftyp" + major brand */
+		/* 'ftyp' must be the first box: size + "ftyp" + major brand */
 
-		if (header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p')
+		if (bytes_read >= 16 && !memcmp(header + 4, "ftyp", 4))
 		{
-			/* Accept 'avif', 'avis', 'avio', 'mif1' major brands */
+			ULONG box_size = ((ULONG)header[0] << 24) |
+			                 ((ULONG)header[1] << 16) |
+			                 ((ULONG)header[2] << 8)  |
+			                  (ULONG)header[3];
+			ULONG i;
+			BOOL major_ok = brand_is_avif(header + 8);
 
-			if ((header[8]  == 'a' && header[9]  == 'v' && header[10] == 'i' && header[11] == 'f') ||
-			    (header[8]  == 'a' && header[9]  == 'v' && header[10] == 'i' && header[11] == 's') ||
-			    (header[8]  == 'a' && header[9]  == 'v' && header[10] == 'i' && header[11] == 'o') ||
-			    (header[8]  == 'm' && header[9]  == 'i' && header[10] == 'f' && header[11] == '1'))
+			/*
+			 * Walk the compatible brand list: major brand, minor
+			 * version, then 4 byte brands.  A 64 bit large size is
+			 * accepted here as well; the brand layout is unchanged.
+			 */
+			for (i = 16; !major_ok && (i + 4) <= bytes_read; i += 4)
+			{
+				if (brand_is_avif(header + i)) major_ok = TRUE;
+			}
+
+			if (major_ok && box_size >= 16)
 			{
 				probability = 9500;
 
-				/* Heuristic: check stream length is plausible (not zero, not tiny) */
+				/* Heuristic: stream length is plausible */
 
 				{
-					UQUAD stream_length = MediaGetPort64(dcc->dcc_Source, dcc->dcc_Port, MMA_StreamLength);
-					if (stream_length > 0 && stream_length > 12)
-						probability += 500;
+					UQUAD stream_length = MediaGetPort64(dcc->dcc_Source,
+					                                     dcc->dcc_Port,
+					                                     MMA_StreamLength);
+
+					if (stream_length >= box_size) probability += 500;
 				}
 			}
 		}

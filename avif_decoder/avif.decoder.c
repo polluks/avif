@@ -73,25 +73,28 @@ struct ObjData
 	ULONG    od_Height;
 	ULONG    od_BitsPerPixel;
 	BOOL     od_UseAlpha;
+	BOOL     od_AlphaPremul;
+	BOOL     od_Monochrome;
 
-	/* the elementary stream */
+	/* colour signalling from the demuxer, used to override the sequence
+	 * header when the container is more specific than the stream */
+	BOOL     od_HaveNclx;
+	ULONG    od_MatrixCoefficients;
+	BOOL     od_FullRange;
+
+	/* the elementary streams */
 	UBYTE   *od_ES;
 	ULONG    od_ESLength;
+	UBYTE   *od_AlphaES;
+	ULONG    od_AlphaESLength;
 
 	/* decoded pixels */
 	UBYTE   *od_Bitmap;
 	ULONG    od_BitmapBytes;
+	ULONG    od_Pos;          /* read position used by Pull on port 1 */
 
-	/* decoded picture (for repeated pulls) */
-	union
-	{
-		struct AvifInfo *od_Info;
-	} od_priv;
-
-	struct AvifInfo od_InfoCopy;
-
-	/* dav1d decoder */
-	Dav1dContext *od_Dav1d;
+	/* state */
+	BOOL          od_Loaded;
 	BOOL          od_DecodeDone;
 };
 
@@ -125,6 +128,7 @@ LONG Get(Class *cl, Object *obj, struct opGet *msg);
 
 LONG Pull(Class *cl, Object *obj, struct mmopData *msg);
 BOOL LoadData(Class *cl, Object *obj);
+static void FreeData(struct ObjData *d);
 
 ///
 /// dummy_function()
@@ -378,181 +382,415 @@ Class *GetClass(VOID)
 ///
 /// LoadData()
 ///
-/// Reads the input format attributes (from avif.demuxer attached to the
-/// input port) and pulls the whole elementary stream, then opens dav1d.
+/// FreeData() - release everything LoadData() may have allocated.
+
+static void FreeData(struct ObjData *d)
+{
+	if (d->od_Bitmap) MediaFreeVec(d->od_Bitmap);
+	d->od_Bitmap = NULL;
+	d->od_BitmapBytes = 0;
+	d->od_Pos = 0;
+
+	if (d->od_ES) MediaFreeVec(d->od_ES);
+	d->od_ES = NULL;
+	d->od_ESLength = 0;
+
+	if (d->od_AlphaES) MediaFreeVec(d->od_AlphaES);
+	d->od_AlphaES = NULL;
+	d->od_AlphaESLength = 0;
+
+	d->od_Loaded     = FALSE;
+	d->od_DecodeDone = FALSE;
+}
+
+///
+/// LoadData() - single initialisation path used by both Setup() and Pull().
+///
+/// Reads the attributes published by avif.demuxer on the input port and copies
+/// the elementary streams it owns.  It is idempotent, so whichever of Setup()
+/// on port 0 or the first Pull() on port 1 happens first, the decoder is only
+/// ever configured once.
 
 BOOL LoadData(Class *cl, Object *obj)
 {
 	GET_DATA;
-	BOOL ok = FALSE;
-	struct AvifInfo *info = (struct AvifInfo*)MediaGetPortFwd(obj, 0, MMA_ExtraData);
+	struct AvifInfo *info;
+	ULONG es_len, alpha_len;
 
+	if (d->od_Loaded) return TRUE;
+
+	info = (struct AvifInfo*)MediaGetPortFwd(obj, 0, MMA_ExtraData);
 	if (!info)
 	{
 		MLOG(LOG_ERRORS, "No AvifInfo from input port.");
 		return FALSE;
 	}
 
-	d->od_Width = info->ai_Width;
-	d->od_Height = info->ai_Height;
-	d->od_BitsPerPixel = info->ai_BitsPerPixel;
-	d->od_UseAlpha = info->ai_UseAlpha;
+	d->od_Width              = info->ai_Width;
+	d->od_Height             = info->ai_Height;
+	d->od_BitsPerPixel       = info->ai_BitsPerPixel;
+	d->od_UseAlpha           = info->ai_UseAlpha ? TRUE : FALSE;
+	d->od_AlphaPremul        = info->ai_AlphaPremul ? TRUE : FALSE;
+	d->od_Monochrome         = info->ai_Monochrome ? TRUE : FALSE;
+	d->od_HaveNclx           = info->ai_HaveNclx ? TRUE : FALSE;
+	d->od_MatrixCoefficients = info->ai_MatrixCoefficients;
+	d->od_FullRange          = info->ai_FullRangeFlag ? TRUE : FALSE;
 
-	if (d->od_Width == 0 || d->od_Height == 0 || d->od_Width >= 0x10000 || d->od_Height >= 0x10000)
+	if (d->od_Width == 0 || d->od_Height == 0 ||
+	    d->od_Width >= 0x10000 || d->od_Height >= 0x10000)
 	{
-		MLOG(LOG_ERRORS, "Invalid dimensions %ld x %ld.", d->od_Width, d->od_Height);
+		MLOG(LOG_ERRORS, "Invalid dimensions %lu x %lu.",
+		     d->od_Width, d->od_Height);
 		return FALSE;
 	}
 
-	/* Pull the complete elementary stream into memory */
-	d->od_ES = (UBYTE*)MediaAllocVec(info->ai_ESLength ? info->ai_ESLength : 4096);
+	es_len    = info->ai_ESLength;
+	alpha_len = info->ai_AlphaES ? info->ai_AlphaESLength : 0;
+
+	if (!es_len || !info->ai_ES)
+	{
+		MLOG(LOG_ERRORS, "Empty elementary stream.");
+		return FALSE;
+	}
+
+	/*
+	 * Copy the streams, so the decoder does not depend on the demuxer's
+	 * buffers staying alive and unmodified.
+	 */
+	d->od_ES = (UBYTE*)MediaAllocVec(es_len);
 	if (!d->od_ES)
 	{
 		MLOG(LOG_ERRORS, "Out of memory for elementary stream.");
 		return FALSE;
 	}
-	d->od_ESLength = info->ai_ESLength;
-	memcpy(d->od_ES, info->ai_ES, d->od_ESLength);
+	memcpy(d->od_ES, info->ai_ES, es_len);
+	d->od_ESLength = es_len;
 
-	/* Open dav1d decoder */
+	if (alpha_len)
 	{
-		Dav1dSettings s;
-		dav1d_default_settings(&s);
-		s.n_threads = 1;
-		s.max_frame_delay = 1;
-		s.apply_grain = 0;
-		s.all_layers = 1;
-		s.operating_point = 0;
-		s.strict_std_compliance = 0;
-		s.inloop_filters = DAV1D_INLOOPFILTER_ALL;
-
-		if (dav1d_open(&d->od_Dav1d, &s) != 0)
+		d->od_AlphaES = (UBYTE*)MediaAllocVec(alpha_len);
+		if (!d->od_AlphaES)
 		{
-			MLOG(LOG_ERRORS, "Unable to open dav1d decoder.");
+			MLOG(LOG_ERRORS, "Out of memory for alpha stream.");
 			MediaFreeVec(d->od_ES);
 			d->od_ES = NULL;
+			d->od_ESLength = 0;
 			return FALSE;
 		}
+		memcpy(d->od_AlphaES, info->ai_AlphaES, alpha_len);
+		d->od_AlphaESLength = alpha_len;
 	}
 
-	ok = TRUE;
-	return ok;
-}
-
-///
-/// Decode() - feed the whole elementary stream to dav1d, decode the
-/// first picture, convert YUV->ARGB32.
-
-static unsigned clip255(LONG v)
-{
-	return (unsigned)((v < 0) ? 0 : (v > 255) ? 255 : v);
-}
-
-///
-/// YUV -> ARGB32 conversion.
-/// Supports 8/10/12 bit, 4:2:0 / 4:2:2 / 4:4:4 / 4:0:0 (mono).
-/// Matrix coefficients from the sequence header: 1 (BT.709),
-/// 5/6 (BT.601/BT.470), 9 (BT.2020). Falls back to BT.601.
-
-static BOOL yuv_to_argb32(const Dav1dPicture *pic, UBYTE *argb)
-{
-	unsigned i, j;
-	const ptrdiff_t stride_y = pic->stride[0];
-	const ptrdiff_t stride_c = pic->stride[1];
-	const int w = pic->p.w;
-	const int h = pic->p.h;
-	const int bpc = pic->p.bpc;
-	const int shift = (bpc > 8) ? (bpc - 8) : 0;
-	const int is16 = (bpc > 8);
-	int ss_x = 0, ss_y = 0;
-	int use_bt709 = 0, use_bt2020 = 0;
-
-	if (!argb || !pic->data[0]) return FALSE;
-
-	/* chroma subsampling from the pixel layout */
-	switch (pic->p.layout)
-	{
-		case DAV1D_PIXEL_LAYOUT_I420: ss_x = 1; ss_y = 1; break;
-		case DAV1D_PIXEL_LAYOUT_I422: ss_x = 1; ss_y = 0; break;
-		case DAV1D_PIXEL_LAYOUT_I444: ss_x = 0; ss_y = 0; break;
-		default: break; /* I400: monochrome, no chroma */
-	}
-
-	/* matrix coefficients */
-	if (pic->seq_hdr)
-	{
-		switch (pic->seq_hdr->mtrx)
-		{
-			case DAV1D_MC_BT709:  use_bt709 = 1;  break;
-			case DAV1D_MC_BT2020_NCL:
-			case DAV1D_MC_BT2020_CL: use_bt2020 = 1; break;
-			default: break;
-		}
-	}
-
-	for (i = 0; i < (unsigned)h; i++)
-	{
-		ULONG *dst = (ULONG*)argb + (i * (ULONG)w);
-		for (j = 0; j < (unsigned)w; j++)
-		{
-			int y, cu = 128, cv = 128;
-			int r, g, b;
-
-			if (is16)
-			{
-				const uint16_t *py = (const uint16_t*)pic->data[0];
-				y = (int)(py[(ptrdiff_t)i * stride_y + (ptrdiff_t)j] >> shift);
-				if (pic->data[1])
-				{
-					const uint16_t *pu = (const uint16_t*)pic->data[1];
-					const uint16_t *pv = (const uint16_t*)pic->data[2];
-					cu = pu[((ptrdiff_t)i >> ss_y) * stride_c + ((ptrdiff_t)j >> ss_x)] >> shift;
-					cv = pv[((ptrdiff_t)i >> ss_y) * stride_c + ((ptrdiff_t)j >> ss_x)] >> shift;
-				}
-			}
-			else
-			{
-				const uint8_t *py = (const uint8_t*)pic->data[0];
-				y = (int)py[(ptrdiff_t)i * stride_y + (ptrdiff_t)j];
-				if (pic->data[1])
-				{
-					const uint8_t *pu = (const uint8_t*)pic->data[1];
-					const uint8_t *pv = (const uint8_t*)pic->data[2];
-					cu = (int)pu[((ptrdiff_t)i >> ss_y) * stride_c + ((ptrdiff_t)j >> ss_x)];
-					cv = (int)pv[((ptrdiff_t)i >> ss_y) * stride_c + ((ptrdiff_t)j >> ss_x)];
-				}
-			}
-
-			/* standard BT.601 */
-			if (use_bt709)
-			{
-				r = y + ((359 * (cv - 128)) >> 8);
-				g = y - ((88 * (cu - 128) + 183 * (cv - 128)) >> 8);
-				b = y + ((454 * (cu - 128)) >> 8);
-			}
-			else if (use_bt2020)
-			{
-				r = y + ((263 * (cv - 128)) >> 7);
-				g = y - ((29 * (cu - 128) + 102 * (cv - 128)) >> 7);
-				b = y + ((335 * (cu - 128)) >> 7);
-			}
-			else
-			{
-				r = y + ((359 * (cv - 128)) >> 8);
-				g = y - ((88 * (cu - 128) + 183 * (cv - 128)) >> 8);
-				b = y + ((454 * (cu - 128)) >> 8);
-			}
-
-			*dst++ = 0xFF000000UL | (clip255(r) << 16) |
-			                        (clip255(g) <<  8) |
-			                         clip255(b);
-		}
-	}
+	d->od_Loaded = TRUE;
 	return TRUE;
 }
 
 ///
-/// DecodeOneFrame()
+/// clip a value to the 8 bit range
+
+static UBYTE clip255(int v)
+{
+	if (v < 0)   return 0;
+	if (v > 255) return 255;
+	return (UBYTE)v;
+}
+
+///
+/// Colour conversion.
+///
+/// The AVIF container wins over the sequence header when it carries nclx
+/// colour information, because nclx describes the colour the image was
+/// encoded in and is what the file's other properties (primary, transfer)
+/// agree with.
+///
+/// YUV samples are first scaled to 16 bit full range (Y in 0..65535, chroma
+/// centred on 0), then converted with integer coefficients in the same scale,
+/// then the high byte is taken.  Scaling to 16 bit rather than 8 bit keeps the
+/// 10 and 12 bit paths from throwing away two to four bits of accuracy before
+/// the matrix is even applied.
+
+struct ColorParams
+{
+	int ylo;           /* lowest luma code value in use      */
+	int yscale;        /* 16.16 fixed point luma scale       */
+	int cscale;        /* 16.16 fixed point chroma scale     */
+	/* matrix coefficients, in 16 bit luma scale */
+	int r_cv, g_cu, g_cv, b_cu;
+};
+
+/*
+ * Coefficients follow ITU-T H.273 / BT.601, BT.709, BT.2020 with
+ *
+ *   R = Y + cr * Cr
+ *   G = Y - cg_u * Cu - cg_v * Cr
+ *   B = Y + cb * Cu
+ *
+ * where Cu and Cr are the chroma differences scaled so that a full swing
+ * chroma sample (half of the code range) maps to +-32768.
+ */
+static void pick_matrix(const struct ObjData *d, const Dav1dPicture *pic,
+                        struct ColorParams *cp)
+{
+	ULONG m = 0;
+
+	/* BT.601 defaults */
+	cp->r_cv = 359; cp->g_cu =  88; cp->g_cv = 183; cp->b_cu = 454;
+
+	if (d->od_HaveNclx) m = d->od_MatrixCoefficients;
+	else if (pic && pic->seq_hdr) m = (ULONG)pic->seq_hdr->mtrx;
+
+	switch (m)
+	{
+		case 1:   /* BT.709 */
+		case 7:   /* SMPTE 240M, BT.709 family */
+		case 13:  /* BT.2020, BT.709 primaries */
+			cp->r_cv = 404; cp->g_cu = 48; cp->g_cv = 119; cp->b_cu = 463;
+		break;
+
+		case 9:   /* BT.2020 non constant luminance */
+		case 10:  /* BT.2020 constant luminance */
+			cp->r_cv = 378; cp->g_cu = 42; cp->g_cv = 146; cp->b_cu = 482;
+		break;
+
+		case 4:   /* FCC 70 */
+			cp->r_cv = 360; cp->g_cu = 89; cp->g_cv = 183; cp->b_cu = 453;
+		break;
+
+		case 5:   /* BT.470BG */
+		case 6:   /* BT.601 / SMPTE 170M */
+		case 0:   /* unspecified, BT.601 is the safe default */
+		case 2:   /* unspecified, RGB is not what AVIF stores */
+		case 8:   /* YCgCo, out of scope for AVIF */
+		default:
+		break;
+	}
+
+	if (d->od_FullRange)
+	{
+		cp->ylo = 0;
+		cp->yscale = (65536 << 8) / 255;
+		cp->cscale = (65536 << 8) / 255;
+	}
+	else
+	{
+		/*
+		 * ITU-T H.273 limited range: luma occupies codes 16..234 and
+		 * chroma 16..240, so both are expanded onto the full 0..255
+		 * range.  Chroma neutral is code 128 in both cases; the range
+		 * expansion is expressed purely through cscale.
+		 */
+		cp->ylo = 16;
+		cp->yscale = (65536 << 8) / 219;
+		cp->cscale = (65536 << 8) / 224;
+	}
+}
+
+///
+/// plane_sample() - read one sample of an 8 or 16 bit plane at (x, y),
+/// clamped to the plane bounds.
+
+static int plane_sample(const void *data, ptrdiff_t stride, int is16, int shift,
+                        int x, int y, int w, int h)
+{
+	if (x >= w) x = w - 1;
+	if (y >= h) y = h - 1;
+
+	if (is16)
+	{
+		const uint16_t *p = (const uint16_t*)data;
+		return (int)p[(ptrdiff_t)y * stride + x] >> shift;
+	}
+	else
+	{
+		const uint8_t *p = (const uint8_t*)data;
+		return (int)p[(ptrdiff_t)y * stride + x];
+	}
+}
+
+///
+/// chroma_at() - fetch a chroma sample with bilinear upsampling.
+///
+/// In AV1 the chroma samples are co-sited with the top left luma sample of
+/// the block they cover, so luma pixel (x, y) sits at chroma coordinate
+/// (x / 2^ss_x, y / 2^ss_y).  That lands exactly between two chroma samples
+/// whenever the corresponding luma coordinate is odd, which is the case that
+/// a plain shift would get wrong.  Interpolating there removes the blocky
+/// chroma edges a nearest neighbour upsample leaves behind.
+
+static int chroma_at(const void *data, ptrdiff_t stride, int is16, int shift,
+                     int x, int y, int ss_x, int ss_y, int cw, int ch)
+{
+	int fx = x & ((1 << ss_x) - 1);
+	int fy = y & ((1 << ss_y) - 1);
+	int x0 = x >> ss_x;
+	int y0 = y >> ss_y;
+	int a = plane_sample(data, stride, is16, shift, x0, y0, cw, ch);
+
+	if (!fx && !fy) return a;
+
+	if (fy)
+	{
+		int b = plane_sample(data, stride, is16, shift, fx ? x0 + 1 : x0, y0, cw, ch);
+		int c = plane_sample(data, stride, is16, shift, x0, y0 + 1, cw, ch);
+
+		if (!fx) return (a + c + 1) >> 1;
+
+		{
+			int d = plane_sample(data, stride, is16, shift, x0 + 1, y0 + 1, cw, ch);
+			return (a + b + c + d + 2) >> 2;
+		}
+	}
+	else
+	{
+		int b = plane_sample(data, stride, is16, shift, x0 + 1, y0, cw, ch);
+		return (a + b + 1) >> 1;
+	}
+}
+
+///
+/// yuv_to_argb32() - scalar YUV to ARGB32 conversion.
+///
+/// Supports 8/10/12 bit samples, 4:4:4 / 4:2:2 / 4:2:0 / monochrome, limited
+/// and full range, and an optional separately coded alpha plane.
+
+static BOOL yuv_to_argb32(const Dav1dPicture *pic, const Dav1dPicture *alpha_pic,
+                          const struct ObjData *d, UBYTE *argb)
+{
+	struct ColorParams cp;
+	ULONG i, j;
+	const int w = (int)d->od_Width;
+	const int h = (int)d->od_Height;
+	const int shift = (pic->p.bpc > 8) ? (pic->p.bpc - 8) : 0;
+	const int is16 = (pic->p.bpc > 8);
+	const int ss_x = (pic->p.layout == DAV1D_PIXEL_LAYOUT_I420 ||
+	                  pic->p.layout == DAV1D_PIXEL_LAYOUT_I422);
+	const int ss_y = (pic->p.layout == DAV1D_PIXEL_LAYOUT_I420);
+	int a_shift = 0, a_is16 = 0;
+	int cw, ch;
+
+	if (!argb || !pic->data[0]) return FALSE;
+
+	if (pic->p.w != w || pic->p.h != h)
+	{
+		MLOGV(LOG_ERRORS, "Decoded size %d x %d differs from %lu x %lu.",
+		      pic->p.w, pic->p.h, d->od_Width, d->od_Height);
+		return FALSE;
+	}
+
+	if (alpha_pic)
+	{
+		if (!alpha_pic->data[0] ||
+		    alpha_pic->p.w != w || alpha_pic->p.h != h)
+		{
+			MLOGV(LOG_ERRORS, "Alpha plane %d x %d is unusable.",
+			      alpha_pic->p.w, alpha_pic->p.h);
+			return FALSE;
+		}
+
+		a_shift = (alpha_pic->p.bpc > 8) ? (alpha_pic->p.bpc - 8) : 0;
+		a_is16 = (alpha_pic->p.bpc > 8);
+	}
+
+	pick_matrix(d, pic, &cp);
+
+	/* chroma plane dimensions, rounded up for odd image sizes */
+	cw = (w + (1 << ss_x) - 1) >> ss_x;
+	ch = (h + (1 << ss_y) - 1) >> ss_y;
+
+	for (i = 0; i < (ULONG)h; i++)
+	{
+		UBYTE *dst = argb + i * (ULONG)w * 4;
+
+		for (j = 0; j < (ULONG)w; j++)
+		{
+			int y, cu = 128, cv = 128, a = 255;
+			int Y, Cb, Cr, r, g, b;
+
+			if (is16)
+			{
+				const uint16_t *py = (const uint16_t*)pic->data[0];
+				y = (int)py[(ptrdiff_t)i * pic->stride[0] + (ptrdiff_t)j] >> shift;
+			}
+			else
+			{
+				const uint8_t *py = (const uint8_t*)pic->data[0];
+				y = (int)py[(ptrdiff_t)i * pic->stride[0] + (ptrdiff_t)j];
+			}
+
+			if (pic->data[1] && pic->data[2])
+			{
+				cu = chroma_at(pic->data[1], pic->stride[1], is16, shift,
+				               (int)j, (int)i, ss_x, ss_y, cw, ch);
+				cv = chroma_at(pic->data[2], pic->stride[1], is16, shift,
+				               (int)j, (int)i, ss_x, ss_y, cw, ch);
+			}
+
+			/* luma to 16 bit full range, 0..65535 */
+			Y = ((y - cp.ylo) * cp.yscale) >> 8;
+			if (Y < 0) Y = 0;
+			if (Y > 65535) Y = 65535;
+
+			if (!pic->data[1])
+			{
+				/* monochrome: Y only */
+				r = g = b = Y;
+			}
+			else
+			{
+				/* chroma to signed 16 bit, centred on code 128 */
+				Cb = ((cu - 128) * cp.cscale) >> 8;
+				Cr = ((cv - 128) * cp.cscale) >> 8;
+
+				r = Y + ((cp.r_cv * Cr) >> 8);
+				g = Y - ((cp.g_cu * Cb + cp.g_cv * Cr) >> 8);
+				b = Y + ((cp.b_cu * Cb) >> 8);
+			}
+
+			if (alpha_pic)
+			{
+				if (a_is16)
+				{
+					const uint16_t *pa = (const uint16_t*)alpha_pic->data[0];
+					a = (int)pa[(ptrdiff_t)i * alpha_pic->stride[0] +
+					            (ptrdiff_t)j] >> a_shift;
+				}
+				else
+				{
+					const uint8_t *pa = (const uint8_t*)alpha_pic->data[0];
+					a = (int)pa[(ptrdiff_t)i * alpha_pic->stride[0] +
+					            (ptrdiff_t)j];
+				}
+
+				if (a < 0) a = 0;
+				if (a > 255) a = 255;
+
+				/*
+				 * ARGB32 carries straight alpha, so the colour is
+				 * left untouched here.  When the file says the
+				 * colour planes were premultiplied they are already
+				 * scaled and must be handed on as they are.
+				 */
+			}
+
+			/*
+			 * ARGB32 is a big endian 32 bit value, so in memory the
+			 * bytes are alpha, red, green, blue in that order.
+			 */
+			dst[0] = (UBYTE)a;
+			dst[1] = clip255(r >> 8);
+			dst[2] = clip255(g >> 8);
+			dst[3] = clip255(b >> 8);
+			dst += 4;
+		}
+	}
+
+	return TRUE;
+}
+
+
+///
+/// data_free_wrap() - dav1d does not take ownership of the data we wrap, so
+/// the buffers stay ours and there is nothing to free here.
 
 static void data_free_wrap(const uint8_t *buf, void *cookie)
 {
@@ -560,89 +798,153 @@ static void data_free_wrap(const uint8_t *buf, void *cookie)
 	(void)cookie;
 }
 
+///
+/// decode_one_stream() - run one AV1 stream through a dav1d instance and
+/// return its first picture.
+///
+/// On success the caller owns both the returned picture and the decoder
+/// instance: dav1d_picture_unref() releases the picture and dav1d_close()
+/// releases the context.  The context has to outlive the picture because the
+/// picture holds references into it.
+
+static BOOL decode_one_stream(const UBYTE *es, ULONG len,
+                              Dav1dContext **ctx_out, Dav1dPicture *out)
+{
+	Dav1dSettings s;
+	Dav1dContext *ctx = NULL;
+	Dav1dData data;
+	int res;
+
+	memset(out, 0, sizeof(*out));
+	*ctx_out = NULL;
+
+	if (!es || !len) return FALSE;
+
+	dav1d_default_settings(&s);
+	s.n_threads = 1;
+	s.max_frame_delay = 1;
+	s.apply_grain = 0;
+	s.all_layers = 1;
+	s.operating_point = 0;
+	s.strict_std_compliance = 0;
+	s.inloop_filters = DAV1D_INLOOPFILTER_ALL;
+
+	if (dav1d_open(&ctx, &s) != 0)
+	{
+		MLOGV(LOG_ERRORS, "Unable to open dav1d decoder.");
+		return FALSE;
+	}
+
+	memset(&data, 0, sizeof(data));
+	if (dav1d_data_wrap(&data, es, len, data_free_wrap, NULL) != 0)
+	{
+		MLOG(LOG_ERRORS, "Unable to wrap elementary stream.");
+		dav1d_close(&ctx);
+		return FALSE;
+	}
+
+	/*
+	 * dav1d consumes the sequence header first and answers EAGAIN because it
+	 * wants the frame that follows.  Flushing with an empty Dav1dData then
+	 * tells it no more data is coming, which is what lets the pending frame
+	 * be decoded.
+	 */
+	res = dav1d_send_data(ctx, &data);
+	if (res != 0 && res != DAV1D_ERR(EAGAIN))
+	{
+		MLOGV(LOG_ERRORS, "dav1d_send_data failed (%d).", res);
+		dav1d_close(&ctx);
+		return FALSE;
+	}
+
+	memset(&data, 0, sizeof(data));
+	dav1d_send_data(ctx, &data);
+
+	res = dav1d_get_picture(ctx, out);
+	if (res == 0)
+	{
+		*ctx_out = ctx;
+		return TRUE;
+	}
+
+	MLOGV(LOG_ERRORS, "No picture decoded from stream (%d).", res);
+	dav1d_close(&ctx);
+	return FALSE;
+}
+
+///
+/// DecodeOneFrame() - decode the colour stream and, when present, the alpha
+/// stream, then convert to ARGB32.
+
 static BOOL DecodeOneFrame(Class *cl, Object *obj)
 {
 	GET_DATA;
-	Dav1dData data;
 	Dav1dPicture pic;
-	int res;
-	BOOL got_picture = FALSE;
-	ULONG need = sizeof(struct AvifInfo);
-	unsigned nframes = 0;
+	Dav1dPicture apic;
+	Dav1dContext *ctx = NULL;
+	Dav1dContext *actx = NULL;
+	BOOL have_alpha = FALSE;
+	BOOL ok = FALSE;
+	ULONG bitmap_bytes;
 
-	/* Feed all data in one go */
-	memset(&data, 0, sizeof(data));
+	if (d->od_DecodeDone) return TRUE;
 
-	if (dav1d_data_wrap(&data, d->od_ES, d->od_ESLength, data_free_wrap, NULL))
+	if (!decode_one_stream(d->od_ES, d->od_ESLength, &ctx, &pic)) return FALSE;
+
+	if (d->od_AlphaES && d->od_AlphaESLength)
 	{
-		MLOG(LOG_ERRORS, "Unable to wrap elementary stream.");
-		return FALSE;
-	}
-
-	res = dav1d_send_data(d->od_Dav1d, &data);
-	if (res != 0)
-	{
-		/* DAV1D_ERR(EAGAIN) means the decoder wants more input */
-		if (res != DAV1D_ERR(EAGAIN))
+		have_alpha = decode_one_stream(d->od_AlphaES, d->od_AlphaESLength,
+		                               &actx, &apic);
+		if (!have_alpha)
 		{
-			MLOGV(LOG_ERRORS, "dav1d_send_data failed (%d).", res);
-			return FALSE;
+			/*
+			 * A missing alpha plane is not fatal: fall back to an
+			 * opaque image rather than failing the whole decode.
+			 */
+			MLOGV(LOG_WARN, "Alpha stream did not decode, using opaque.");
 		}
 	}
 
-	/* Flush: signal end of stream */
-	memset(&data, 0, sizeof(data));
-	dav1d_send_data(d->od_Dav1d, &data);
-
-	/* Retrieve the first decoded picture */
-	memset(&pic, 0, sizeof(pic));
-	while ((res = dav1d_get_picture(d->od_Dav1d, &pic)) == 0)
+	/*
+	 * 32 bit overflow guard.  Both dimensions are already known to be
+	 * below 0x10000, so this rejects anything whose bitmap would not fit
+	 * in a positive LONG range.
+	 */
+	if (d->od_Width > 0x1FFFFFFFUL / d->od_Height)
 	{
-		nframes++;
-		if (nframes > 1) break; /* animations: only stills for now */
-
-		/* Scale check */
-		if (pic.p.w != (int)d->od_Width || pic.p.h != (int)d->od_Height)
-		{
-			MLOGV(LOG_ERRORS, "Decoded size %d x %d differs from reported %ld x %ld.",
-			      (int)pic.p.w, (int)pic.p.h,
-			      d->od_Width, d->od_Height);
-			dav1d_picture_unref(&pic);
-			return FALSE;
-		}
-
-		/* Allocate ARGB32 bitmap */
-		d->od_BitmapBytes = d->od_Width * d->od_Height * 4;
-		d->od_Bitmap = (UBYTE*)MediaAllocVec(d->od_BitmapBytes);
-		if (!d->od_Bitmap)
-		{
-			MLOG(LOG_ERRORS, "Out of memory for bitmap.");
-			dav1d_picture_unref(&pic);
-			return FALSE;
-		}
-
-		if (!yuv_to_argb32(&pic, d->od_Bitmap))
-		{
-			MediaFreeVec(d->od_Bitmap);
-			d->od_Bitmap = NULL;
-			dav1d_picture_unref(&pic);
-			return FALSE;
-		}
-
-		dav1d_picture_unref(&pic);
-		got_picture = TRUE;
+		MLOG(LOG_ERRORS, "Bitmap size overflow.");
+		goto cleanup;
 	}
 
-	if (!got_picture)
+	bitmap_bytes = d->od_Width * d->od_Height * 4;
+
+	d->od_Bitmap = (UBYTE*)MediaAllocVec(bitmap_bytes);
+	if (!d->od_Bitmap)
 	{
-		MLOGV(LOG_ERRORS, "dav1d_get_picture failed (%d).", res);
-		return FALSE;
+		MLOG(LOG_ERRORS, "Out of memory for bitmap.");
+		goto cleanup;
+	}
+	d->od_BitmapBytes = bitmap_bytes;
+
+	if (!yuv_to_argb32(&pic, have_alpha ? &apic : NULL, d, d->od_Bitmap))
+	{
+		MediaFreeVec(d->od_Bitmap);
+		d->od_Bitmap = NULL;
+		d->od_BitmapBytes = 0;
+		goto cleanup;
 	}
 
-	d->od_DecodeDone = TRUE;
+	ok = TRUE;
 
-	(void)need;
-	return TRUE;
+cleanup:
+	if (have_alpha) dav1d_picture_unref(&apic);
+	if (actx) dav1d_close(&actx);
+	dav1d_picture_unref(&pic);
+	if (ctx) dav1d_close(&ctx);
+
+	if (ok) d->od_DecodeDone = TRUE;
+
+	return ok;
 }
 
 ///
@@ -672,11 +974,19 @@ LONG New(Class *cl, Object *obj, struct opSet *msg)
 		d->od_Height = 0;
 		d->od_BitsPerPixel = 0;
 		d->od_UseAlpha = FALSE;
+		d->od_AlphaPremul = FALSE;
+		d->od_Monochrome = FALSE;
+		d->od_HaveNclx = FALSE;
+		d->od_MatrixCoefficients = 0;
+		d->od_FullRange = FALSE;
 		d->od_ES = NULL;
 		d->od_ESLength = 0;
+		d->od_AlphaES = NULL;
+		d->od_AlphaESLength = 0;
 		d->od_Bitmap = NULL;
 		d->od_BitmapBytes = 0;
-		d->od_Dav1d = NULL;
+		d->od_Pos = 0;
+		d->od_Loaded = FALSE;
 		d->od_DecodeDone = FALSE;
 
 		newobj = (LONG)obj;
@@ -698,9 +1008,7 @@ LONG Dispose(Class *cl, Object *obj, Msg msg)
 
 	DoMethod(obj, MMM_LockObject);
 
-	if (d->od_Bitmap) MediaFreeVec(d->od_Bitmap);
-	if (d->od_ES) MediaFreeVec(d->od_ES);
-	if (d->od_Dav1d) dav1d_close(&d->od_Dav1d);
+	FreeData(d);
 
 	DoMethod(obj, MMM_UnlockObject);
 	return DoSuperMethodA(cl, obj, msg);
@@ -729,6 +1037,15 @@ LONG Get(Class *cl, Object *obj, struct opGet *msg)
 
 		case MMA_Video_UseAlpha:
 			*msg->opg_Storage = d->od_UseAlpha;
+			return TRUE;
+
+		case MMA_Video_FrameCount:
+			/*
+			 * A picture attribute is a LONG on MorphOS, so the value
+			 * is written as a LONG rather than through a UQUAD cast,
+			 * which would write past the caller's storage.
+			 */
+			*msg->opg_Storage = (LONG)1;
 			return TRUE;
 
 		case MMA_DataFormat:
@@ -764,21 +1081,39 @@ LONG Pull(Class *cl, Object *obj, struct mmopData *msg)
 			break;
 
 			case 1:
-				/* Decode once, then serve bitmap rows */
+			{
+				ULONG avail, want;
+
+				/* Decode lazily on the first pull of the image. */
 				if (!d->od_DecodeDone)
 				{
 					if (!LoadData(cl, obj)) break;
 					if (!DecodeOneFrame(cl, obj)) break;
 				}
 
-				if (d->od_Bitmap && d->od_BitmapBytes)
+				if (!d->od_Bitmap || !d->od_BitmapBytes)
 				{
-					ULONG avail = d->od_BitmapBytes;
-					ULONG want = msg->Length & 0xFFFFFFFC;  /* whole pixels */
-					if (want > avail) want = avail;
-					memcpy(msg->Buffer, d->od_Bitmap, want);
-					bytes_pulled = want;
+					seterr(MMERR_END_OF_DATA);
+					break;
 				}
+
+				if (d->od_Pos >= d->od_BitmapBytes)
+				{
+					seterr(MMERR_END_OF_DATA);
+					break;
+				}
+
+				avail = d->od_BitmapBytes - d->od_Pos;
+
+				/* pull only whole pixels */
+				want = msg->Length & ~3UL;
+				if (!want) want = 4;
+				if (want > avail) want = avail;
+
+				memcpy(msg->Buffer, d->od_Bitmap + d->od_Pos, want);
+				d->od_Pos += want;
+				bytes_pulled = want;
+			}
 			break;
 
 			default:
@@ -806,6 +1141,11 @@ LONG Setup(Class *cl, Object *obj, struct mmopPort *msg)
 
 	if (msg->Port == 0)
 	{
+		/*
+		 * Only pull in the attributes here.  Decoding is left to the
+		 * first Pull() on the output port, because the input stream is
+		 * not guaranteed to be fully set up at Setup() time.
+		 */
 		rv = LoadData(cl, obj);
 	}
 	else if (msg->Port == 1) rv = TRUE;
@@ -825,6 +1165,9 @@ LONG GetPort(Class *cl, Object *obj, struct mmopGetPort *msg)
 		case MMA_Video_Height:
 		case MMA_Video_BitsPerPixel:
 		case MMA_Video_UseAlpha:
+		case MMA_Video_FrameCount:
+		case MMA_DataFormat:
+		case MMA_MediaType:
 		return DoMethod(obj, OM_GET, msg->Attribute, (ULONG)msg->Storage);
 	}
 	return (DoSuperMethodA(cl, obj, (Msg)msg));
