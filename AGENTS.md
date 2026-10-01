@@ -197,3 +197,4 @@ premultiplied); single-plane AVIF only. Attributes on Get/GetPort:
 - [x] Push both plugins to GitHub as the `avif` repo (polluks/avif,
       `avif_demuxer/` + `avif_decoder/`)
 - [ ] Verify on real MorphOS hardware (needs ppc-morphos-gcc + Reggae SDK)
+- [ ] Write Autodocs `avif.demuxer.doc` and `avif.demuxer.doc`
