@@ -419,7 +419,21 @@ BOOL LoadData(Class *cl, Object *obj)
 
 	if (d->od_Loaded) return TRUE;
 
-	info = (struct AvifInfo*)MediaGetPortFwd(obj, 0, MMA_ExtraData);
+	/*
+	 * The AvifInfo pointer travels as an attribute value, so it has to be
+	 * fetched through storage: MediaGetPortFwd() hands the value back in
+	 * the return register, which is 32 bit on MorphOS and cannot carry a
+	 * pointer.  It is also a varargs call, so the storage pointer has to
+	 * be passed even when only the value is wanted.
+	 */
+	ULONG info_ptr = 0;
+
+	if (!MediaGetPortFwd(obj, 0, MMA_ExtraData, &info_ptr))
+	{
+		MLOG(LOG_ERRORS, "No AvifInfo from input port.");
+		return FALSE;
+	}
+	info = (struct AvifInfo*)(APTR)info_ptr;
 	if (!info)
 	{
 		MLOG(LOG_ERRORS, "No AvifInfo from input port.");
@@ -516,14 +530,16 @@ struct ColorParams
 	int cscale;        /* 16.16 fixed point chroma scale     */
 	/* matrix coefficients, in 16 bit luma scale */
 	int r_cv, g_cu, g_cv, b_cu;
+	/* matrix_coefficients 0: H.273 identity (GBR), not a YCbCr matrix */
+	int gbr;
 };
 
 /*
  * Coefficients follow ITU-T H.273 / BT.601, BT.709, BT.2020 with
  *
- *   R = Y + cr * Cr
- *   G = Y - cg_u * Cu - cg_v * Cr
- *   B = Y + cb * Cu
+ *   R = Y + r_cv * Cr
+ *   G = Y - g_cu * Cu - g_cv * Cr
+ *   B = Y + b_cu * Cu
  *
  * where Cu and Cr are the chroma differences scaled so that a full swing
  * chroma sample (half of the code range) maps to +-32768.
@@ -533,35 +549,54 @@ static void pick_matrix(const struct ObjData *d, const Dav1dPicture *pic,
 {
 	ULONG m = 0;
 
-	/* BT.601 defaults */
-	cp->r_cv = 359; cp->g_cu =  88; cp->g_cv = 183; cp->b_cu = 454;
+	/* BT.601 is the safe default for everything AVIF can carry */
+	cp->r_cv = 359; cp->g_cu = 88; cp->g_cv = 183; cp->b_cu = 454;
+	cp->gbr = FALSE;
 
 	if (d->od_HaveNclx) m = d->od_MatrixCoefficients;
 	else if (pic && pic->seq_hdr) m = (ULONG)pic->seq_hdr->mtrx;
 
+	/*
+	 * The table below is the exact inverse of the H.273 forward matrix,
+	 * rounded to the 16.16 scale in which the coefficients live:
+	 *
+	 *   R = Y + 2*(1-Kr)*Cr
+	 *   G = Y - 2*Kb*(1-Kb)/Kg * Cu - 2*Kr*(1-Kr)/Kg * Cr
+	 *   B = Y + 2*(1-Kb)*Cu
+	 *
+	 * Note that the green coefficients are 2*Kx*(1-Kx)/Kg, not the
+	 * frequently quoted 2*Kx/(1-Kx); the latter is only valid when
+	 * Kg == 1-Kr-Kb is folded in, and is wrong by up to 25% for 601.
+	 */
 	switch (m)
 	{
 		case 1:   /* BT.709 */
-		case 7:   /* SMPTE 240M, BT.709 family */
-		case 13:  /* BT.2020, BT.709 primaries */
-			cp->r_cv = 404; cp->g_cu = 48; cp->g_cv = 119; cp->b_cu = 463;
+		case 7:   /* SMPTE 240M, approximated as BT.709 here */
+		case 12:  /* chromaticity derived, as BT.709 */
+		case 13:  /* chromaticity derived constant luminance */
+		case 14:  /* ICtCp, approximated as BT.709 */
+			cp->r_cv = 403; cp->g_cu = 48; cp->g_cv = 120; cp->b_cu = 475;
 		break;
 
 		case 9:   /* BT.2020 non constant luminance */
 		case 10:  /* BT.2020 constant luminance */
+		case 11:  /* BT.2020 constant luminance */
 			cp->r_cv = 378; cp->g_cu = 42; cp->g_cv = 146; cp->b_cu = 482;
 		break;
 
 		case 4:   /* FCC 70 */
-			cp->r_cv = 360; cp->g_cu = 89; cp->g_cv = 183; cp->b_cu = 453;
+			cp->r_cv = 358; cp->g_cu = 85; cp->g_cv = 182; cp->b_cu = 456;
 		break;
 
 		case 5:   /* BT.470BG */
 		case 6:   /* BT.601 / SMPTE 170M */
-		case 0:   /* unspecified, BT.601 is the safe default */
 		case 2:   /* unspecified, RGB is not what AVIF stores */
 		case 8:   /* YCgCo, out of scope for AVIF */
 		default:
+		break;
+
+		case 0:   /* H.273 identity: G in the luma plane, R and B in chroma */
+			cp->gbr = TRUE;
 		break;
 	}
 
@@ -588,6 +623,10 @@ static void pick_matrix(const struct ObjData *d, const Dav1dPicture *pic,
 ///
 /// plane_sample() - read one sample of an 8 or 16 bit plane at (x, y),
 /// clamped to the plane bounds.
+///
+/// stride is the distance between two rows measured in samples, not in bytes:
+/// Dav1dPicture.stride[] is a byte count, so 16 bit planes have to halve it
+/// before it is used to index a uint16_t.
 
 static int plane_sample(const void *data, ptrdiff_t stride, int is16, int shift,
                         int x, int y, int w, int h)
@@ -667,8 +706,21 @@ static BOOL yuv_to_argb32(const Dav1dPicture *pic, const Dav1dPicture *alpha_pic
 	const int ss_y = (pic->p.layout == DAV1D_PIXEL_LAYOUT_I420);
 	int a_shift = 0, a_is16 = 0;
 	int cw, ch;
+	/*
+	 * Dav1dPicture.stride[] is a byte distance between two rows, so for
+	 * the 10 and 12 bit planes it has to be halved before it is used as
+	 * an offset into a uint16_t array.
+	 */
+	ptrdiff_t ystride = pic->stride[0], cstride = pic->stride[1];
+	ptrdiff_t astride = 0;
 
 	if (!argb || !pic->data[0]) return FALSE;
+
+	if (pic->p.bpc > 8)
+	{
+		ystride /= 2;
+		cstride /= 2;
+	}
 
 	if (pic->p.w != w || pic->p.h != h)
 	{
@@ -689,6 +741,9 @@ static BOOL yuv_to_argb32(const Dav1dPicture *pic, const Dav1dPicture *alpha_pic
 
 		a_shift = (alpha_pic->p.bpc > 8) ? (alpha_pic->p.bpc - 8) : 0;
 		a_is16 = (alpha_pic->p.bpc > 8);
+		astride = alpha_pic->stride[0];
+
+		if (a_is16) astride /= 2;
 	}
 
 	pick_matrix(d, pic, &cp);
@@ -709,19 +764,19 @@ static BOOL yuv_to_argb32(const Dav1dPicture *pic, const Dav1dPicture *alpha_pic
 			if (is16)
 			{
 				const uint16_t *py = (const uint16_t*)pic->data[0];
-				y = (int)py[(ptrdiff_t)i * pic->stride[0] + (ptrdiff_t)j] >> shift;
+				y = (int)py[(ptrdiff_t)i * ystride + (ptrdiff_t)j] >> shift;
 			}
 			else
 			{
 				const uint8_t *py = (const uint8_t*)pic->data[0];
-				y = (int)py[(ptrdiff_t)i * pic->stride[0] + (ptrdiff_t)j];
+				y = (int)py[(ptrdiff_t)i * ystride + (ptrdiff_t)j];
 			}
 
 			if (pic->data[1] && pic->data[2])
 			{
-				cu = chroma_at(pic->data[1], pic->stride[1], is16, shift,
+				cu = chroma_at(pic->data[1], cstride, is16, shift,
 				               (int)j, (int)i, ss_x, ss_y, cw, ch);
-				cv = chroma_at(pic->data[2], pic->stride[1], is16, shift,
+				cv = chroma_at(pic->data[2], cstride, is16, shift,
 				               (int)j, (int)i, ss_x, ss_y, cw, ch);
 			}
 
@@ -730,17 +785,35 @@ static BOOL yuv_to_argb32(const Dav1dPicture *pic, const Dav1dPicture *alpha_pic
 			if (Y < 0) Y = 0;
 			if (Y > 65535) Y = 65535;
 
+			/* chroma to signed 16 bit, centred on code 128 */
+			if (pic->data[1])
+			{
+				Cb = ((cu - 128) * cp.cscale) >> 8;
+				Cr = ((cv - 128) * cp.cscale) >> 8;
+			}
+			else
+			{
+				Cb = Cr = 0;
+			}
+
 			if (!pic->data[1])
 			{
 				/* monochrome: Y only */
 				r = g = b = Y;
 			}
+			else if (cp.gbr)
+			{
+				/*
+				 * H.273 identity (GBR): the luma plane carries
+				 * green and the two chroma planes carry red
+				 * and blue, both centred on code 128.
+				 */
+				r = 32768 + Cr;
+				g = Y;
+				b = 32768 + Cb;
+			}
 			else
 			{
-				/* chroma to signed 16 bit, centred on code 128 */
-				Cb = ((cu - 128) * cp.cscale) >> 8;
-				Cr = ((cv - 128) * cp.cscale) >> 8;
-
 				r = Y + ((cp.r_cv * Cr) >> 8);
 				g = Y - ((cp.g_cu * Cb + cp.g_cv * Cr) >> 8);
 				b = Y + ((cp.b_cu * Cb) >> 8);
@@ -751,14 +824,12 @@ static BOOL yuv_to_argb32(const Dav1dPicture *pic, const Dav1dPicture *alpha_pic
 				if (a_is16)
 				{
 					const uint16_t *pa = (const uint16_t*)alpha_pic->data[0];
-					a = (int)pa[(ptrdiff_t)i * alpha_pic->stride[0] +
-					            (ptrdiff_t)j] >> a_shift;
+					a = (int)pa[(ptrdiff_t)i * astride + (ptrdiff_t)j] >> a_shift;
 				}
 				else
 				{
 					const uint8_t *pa = (const uint8_t*)alpha_pic->data[0];
-					a = (int)pa[(ptrdiff_t)i * alpha_pic->stride[0] +
-					            (ptrdiff_t)j];
+					a = (int)pa[(ptrdiff_t)i * astride + (ptrdiff_t)j];
 				}
 
 				if (a < 0) a = 0;
@@ -823,7 +894,12 @@ static BOOL decode_one_stream(const UBYTE *es, ULONG len,
 	dav1d_default_settings(&s);
 	s.n_threads = 1;
 	s.max_frame_delay = 1;
-	s.apply_grain = 0;
+	/*
+	 * Film grain synthesis stays enabled.  The grain parameters are part
+	 * of the coded image, so this is what avifdec and libavif render; the
+	 * tests compare against those, and dropping the grain would silently
+	 * lose encoded detail.
+	 */
 	s.all_layers = 1;
 	s.operating_point = 0;
 	s.strict_std_compliance = 0;
@@ -858,7 +934,13 @@ static BOOL decode_one_stream(const UBYTE *es, ULONG len,
 	}
 
 	memset(&data, 0, sizeof(data));
-	dav1d_send_data(ctx, &data);
+	res = dav1d_send_data(ctx, &data);
+	if (res != 0 && res != DAV1D_ERR(EAGAIN))
+	{
+		MLOGV(LOG_ERRORS, "dav1d_send_data flush failed (%d).", res);
+		dav1d_close(&ctx);
+		return FALSE;
+	}
 
 	res = dav1d_get_picture(ctx, out);
 	if (res == 0)
@@ -1103,12 +1185,21 @@ LONG Pull(Class *cl, Object *obj, struct mmopData *msg)
 					break;
 				}
 
-				avail = d->od_BitmapBytes - d->od_Pos;
+avail = d->od_BitmapBytes - d->od_Pos;
 
-				/* pull only whole pixels */
-				want = msg->Length & ~3UL;
-				if (!want) want = 4;
-				if (want > avail) want = avail;
+			/*
+			 * Only whole pixels are handed out.  A request
+			 * that is too short for even one pixel cannot be
+			 * satisfied, and forcing four bytes there would
+			 * write past the end of the caller's buffer.
+			 */
+			want = msg->Length & ~3UL;
+			if (!want)
+			{
+				seterr(MMERR_WRONG_ARGUMENTS);
+				break;
+			}
+			if (want > avail) want = avail;
 
 				memcpy(msg->Buffer, d->od_Bitmap + d->od_Pos, want);
 				d->od_Pos += want;

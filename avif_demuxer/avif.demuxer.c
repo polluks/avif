@@ -193,6 +193,13 @@ struct ObjData
 	UQUAD od_AlphaItemID;
 	BOOL  od_HaveAlphaItem;
 
+	/*
+	 * The item an 'auxl' reference points the primary item at.  It is only
+	 * used as a fallback: an 'auxC' property on the item itself names it
+	 * much more precisely.
+	 */
+	UQUAD od_AlphaRefItemID;
+
 	/* number of frames in the sequence (1 for a still image) */
 	ULONG od_FrameCount;
 
@@ -755,9 +762,16 @@ static BOOL parse_ftyp(struct MemCtx *mc, ULONG box_size)
 /// boxes would shift every subsequent index and attach the wrong property
 /// to the item.
 ///
-static BOOL parse_ipco(struct MemCtx *mc, struct ParsedProp *props, ULONG *num_props)
+static BOOL parse_ipco(struct MemCtx *mc, struct ParsedProp *props,
+                       ULONG *num_props, ULONG ipco_end)
 {
-	while (mc_remaining(mc) >= 8)
+	/*
+	 * Stop at the end of ipco.  The buffer holds the whole meta hierarchy,
+	 * so the ipma box that follows would otherwise be recorded as one more
+	 * property - harmless on its own, but the walk then ends on whatever
+	 * box happens to follow and reports a corrupt container.
+	 */
+	while (mc_tell(mc) + 8 <= ipco_end)
 	{
 		UBYTE child_type[4];
 		UQUAD child_size, child_payload;
@@ -769,6 +783,8 @@ static BOOL parse_ipco(struct MemCtx *mc, struct ParsedProp *props, ULONG *num_p
 			return FALSE;
 		}
 		child_start = mc_tell(mc);
+
+		if (child_start + (ULONG)child_payload > ipco_end) return FALSE;
 
 		if (*num_props < AVIF_MAX_PROPERTIES)
 		{
@@ -1028,6 +1044,7 @@ static void free_header_data(struct ObjData *d)
 	d->od_HavePrimaryItemID = FALSE;
 	d->od_AlphaItemID = 0;
 	d->od_HaveAlphaItem = FALSE;
+	d->od_AlphaRefItemID = 0;
 	d->od_AlphaPremul = FALSE;
 	d->od_FrameCount = 1;
 	d->od_Width = 0;
@@ -1238,7 +1255,7 @@ static BOOL parse_iloc(struct MemCtx *mc, struct ObjData *d, UQUAD stream_length
 		{
 			UQUAD v;
 			if (!mc_read_uint(mc, 2, &v)) return FALSE;
-			construction = (ULONG)(v & 0x0F);
+			construction = (ULONG)((v >> 12) & 0x0F);
 		}
 
 		/* data_reference_index */
@@ -1372,60 +1389,121 @@ static BOOL parse_ipma(struct MemCtx *mc, struct ObjData *d,
 }
 
 ///
-/// parse 'iref' - item references.  We only care about 'dimg' from the
-/// primary item, which points at the derived (alpha) item.
+///
+/// parse 'iref' - item references.
+///
+/// The version lives in the 'iref' box itself and decides how wide the item
+/// IDs in every contained reference are; a reference box carries no header
+/// of its own:
+///
+///   unsigned int(16 or 32) from_item_ID;   32 bit from version 1 on
+///   unsigned int(16)        reference_count;
+///   unsigned int(16 or 32) to_item_ID[reference_count];
+///
+/// where the target IDs widen to 32 bits in version 1 only.  libavif writes
+/// an 'auxl' reference from the alpha item to the primary item and, when the
+/// colour planes are premultiplied, a 'prem' reference from the primary item
+/// to that same alpha item.
 
-static BOOL parse_iref(struct MemCtx *mc, struct ObjData *d)
+static void note_alpha_ref(struct ObjData *d, UQUAD from_id, UQUAD to_id,
+                           BOOL is_alpha_ref, BOOL is_premul_ref)
+{
+	UQUAD other;
+
+	if (!d->od_HavePrimaryItemID) return;
+
+	if (from_id == d->od_PrimaryItemID)
+	{
+		other = to_id;
+	}
+	else if (to_id == d->od_PrimaryItemID)
+	{
+		other = from_id;
+	}
+	else
+	{
+		return;             /* unrelated items */
+	}
+
+	if (is_premul_ref)
+	{
+		/* 'prem' always points from the premultiplied item to its alpha */
+		if (from_id != d->od_PrimaryItemID) return;
+		d->od_AlphaPremul = TRUE;
+		if (!d->od_AlphaRefItemID) d->od_AlphaRefItemID = other;
+		return;
+	}
+
+	if (is_alpha_ref && !d->od_AlphaRefItemID) d->od_AlphaRefItemID = other;
+}
+
+static BOOL parse_iref(struct MemCtx *mc, struct ObjData *d, ULONG iref_end)
 {
 	UBYTE ver_flags[4];
+	ULONG version;
 
-	/* FullBox header; the version only affects the iref box itself. */
+	/* FullBox header, its version is inherited by every reference below */
 	if (mc_remaining(mc) < 4) return FALSE;
+	if (iref_end < mc_tell(mc) + 4) return FALSE;
 	if (!mc_read(mc, ver_flags, 4)) return FALSE;
+	version = ver_flags[0];
 
-	while (mc_remaining(mc) >= 8)
+	/*
+	 * Only the children that live inside this box are references of this
+	 * iref.  The buffer keeps going past the box - it holds the whole meta
+	 * hierarchy - so walking until the data runs out would read the next
+	 * sibling box as if it were a reference.
+	 */
+	while (mc_tell(mc) + 8 <= iref_end)
 	{
 		UBYTE type[4];
 		UQUAD box_size, payload;
 		ULONG hdr_size, box_end;
 		UQUAD from_id = 0, ref_count = 0, r;
-		BOOL is_dimg;
+		ULONG from_size, to_size;
+		BOOL is_alpha_ref, is_premul_ref;
 
 		if (!mc_read_box_header(mc, type, &box_size, &hdr_size, &payload)) return FALSE;
 		if (payload > mc_remaining(mc)) return FALSE;
 		box_end = mc_tell(mc) + (ULONG)payload;
 
-		is_dimg = !memcmp(type, "dimg", 4);
+		/* a reference that reaches past its box is not one of ours */
+		if (box_end > iref_end) return FALSE;
 
-		if (mc_remaining(mc) >= 4)
+		from_size = (version >= 1) ? 4 : 2;
+		to_size   = (version == 1) ? 4 : 2;
+
+		/* 'dimg' links derived items (frames, thumbnails), not alpha */
+		is_alpha_ref  = !memcmp(type, "auxl", 4);
+		is_premul_ref = !memcmp(type, "prem", 4);
+
+		if (payload < from_size + 2)
 		{
-			UBYTE inner[4];
-			ULONG id_size;
-
-			if (!mc_read(mc, inner, 4)) return FALSE;
-
+			MLOGV(LOG_WARN, "iref '%s' is too short.", type);
+		}
+		else if (!mc_read_uint(mc, from_size, &from_id) ||
+		         !mc_read_uint(mc, 2, &ref_count))
+		{
+			return FALSE;
+		}
+		else if (payload != (UQUAD)from_size + 2 + ref_count * to_size)
+		{
 			/*
-			 * Each child box is a SingleItemTypeReference with its own
-			 * version, so the item ID width comes from the child box
-			 * and not from the enclosing iref version.
+			 * The reference does not fill its box with the widths
+			 * this version implies.  Skip it rather than trust the
+			 * IDs: a reference is a hint, and a wrong one is worse
+			 * than a missing one.
 			 */
-			id_size = (inner[0] >= 1) ? 4 : 2;
-
-			if (!mc_read_uint(mc, id_size, &from_id)) return FALSE;
-			if (!mc_read_uint(mc, 2, &ref_count)) return FALSE;
-
-			if (is_dimg && d->od_HavePrimaryItemID && from_id == d->od_PrimaryItemID)
+			MLOGV(LOG_WARN, "iref '%s': unexpected reference layout.", type);
+		}
+		else
+		{
+			for (r = 0; r < ref_count; r++)
 			{
-				for (r = 0; r < ref_count; r++)
-				{
-					UQUAD to_id = 0;
-					if (!mc_read_uint(mc, id_size, &to_id)) return FALSE;
-					if (!d->od_HaveAlphaItem)
-					{
-						d->od_AlphaItemID = to_id;
-						d->od_HaveAlphaItem = TRUE;
-					}
-				}
+				UQUAD to_id = 0;
+
+				if (!mc_read_uint(mc, to_size, &to_id)) return FALSE;
+				note_alpha_ref(d, from_id, to_id, is_alpha_ref, is_premul_ref);
 			}
 		}
 
@@ -1684,7 +1762,12 @@ static BOOL find_rdf_li(const UBYTE *xmp, ULONG len, ULONG *pos)
 		if (!lt) return FALSE;
 		at = (ULONG)(lt - xmp);
 
-		if (at + 8 <= len && !memcmp(xmp + at, "<rdf:li", 8))
+		/*
+		 * "<rdf:li" is seven characters; comparing eight would ask for
+		 * a NUL where the real payload has a space or the first letter of
+		 * an attribute, so the element form would never be recognised.
+		 */
+		if (at + 7 <= len && !memcmp(xmp + at, "<rdf:li", 7))
 		{
 			*pos = at;
 			return TRUE;
@@ -1968,7 +2051,7 @@ BOOL GetHeader(Class *cl, Object *obj)
 			}
 			else if (!memcmp(type, "iref", 4))
 			{
-				ok = parse_iref(&mc_meta, pd);
+				ok = parse_iref(&mc_meta, pd, (ULONG)box_end);
 			}
 			else if (!memcmp(type, "iprp", 4))
 			{
@@ -1994,7 +2077,7 @@ BOOL GetHeader(Class *cl, Object *obj)
 
 					if (!memcmp(ptype, "ipco", 4))
 					{
-						ok = parse_ipco(&mc_meta, props, &num_props);
+						ok = parse_ipco(&mc_meta, props, &num_props, (ULONG)pend);
 					}
 					else if (!memcmp(ptype, "ipma", 4))
 					{
@@ -2099,6 +2182,23 @@ BOOL GetHeader(Class *cl, Object *obj)
 			pd->od_HaveAlphaItem = TRUE;
 		}
 		if (is_premul) pd->od_AlphaPremul = TRUE;
+	}
+
+	/*
+	 * Fall back on the item an 'auxl' reference points at when no item
+	 * carries the alpha auxC URN, which is how some writers identify it.
+	 */
+	if (!pd->od_HaveAlphaItem && pd->od_AlphaRefItemID)
+	{
+		struct ItemDesc *it = find_item(pd, pd->od_AlphaRefItemID, FALSE);
+
+		if (it && it->id_IsAv01)
+		{
+			pd->od_AlphaItemID = it->id_ItemID;
+			pd->od_HaveAlphaItem = TRUE;
+			MLOGV(LOG_INFO, "Alpha item %lu taken from an auxl reference.",
+			      (ULONG)it->id_ItemID);
+		}
 	}
 
 	/*
