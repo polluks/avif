@@ -101,11 +101,15 @@ against the known stream length (`MediaGetPort64(obj, 0, MMA_StreamLength)`).
 Boxes to walk:
 
 - `ftyp` (full box, version 0): `major_brand` 4cc (usually `avif`), minor
-  version u32, `compatible_brands[]`. Recognition also accepts `avis` /
-  `avio` / `mif1` majors and `avif`/`avis` in compatible brands.
+  version u32, `compatible_brands[]`. Accepted when the major brand is
+  `avif`, `avis` or `avio`, or when any compatible brand is `avif` or `avis`
+  (libavif `avifCheckAVIFBrand`; `mif1` alone is plain HEIF and is *not*
+  accepted). `recognize.c` and `parse_ftyp()` must apply this same rule, and
+  both must honour `size==1` - the brand payload then starts 8 bytes later.
 - `meta` (full box): children include `hdlr` (handler subtype `pict`),
   `pitm` (primary item id: u16 for v0/v1, u32 for v2),
-  `iloc`, `iinf`, `iprp`; may be at top level or inside `moov`.
+  `iloc`, `iinf`, `iprp`. It is a **top-level** box; `moov` is a movie/track
+  box in AVIF and is not searched for a `meta`, matching libavif.
 - `iloc` (item location): after full-box header - offset_size(4b),
   length_size(4b), base_offset_size(4b), index_size(4b) in the top byte;
   `item_count` u16; then per item: item_ID u16, (`data_reference_index` u16
@@ -116,7 +120,10 @@ Boxes to walk:
   offset u(offset_size), length u(length_size)}. Absolute file offsets =
   base_offset + sum of preceding extent lengths (+ construction_method
   0 uses absolute offsets, 1 = relative to extended type, 2 = iloc-relative).
-  AVIF files use method 0.
+  AVIF files use method 0. Two details that are easy to get backwards:
+  `index_size` is only reserved-and-zero for version 0, it must be honoured
+  from version 1 on, and the construction method is the **low** nibble of the
+  16-bit field (the high nibble is `data_reference_index`).
 - `iinf` (version 0: item_count u16; v1: u32), `infe` items with
   `item_type` 4cc (`av01` = AV1 item, `Grid`, `hvc1`, etc.).
 - `iprp` → `ipco` (property container) + `ipma` (item property association).
@@ -171,15 +178,37 @@ premultiplied); single-plane AVIF only. Attributes on Get/GetPort:
 ## Build notes
 
 - avif.demuxer: files `avif_demuxer/avif.demuxer.c`, `avif.demuxer.h`,
-  `class_version.h`, `recognize.c`, `Makefile` (ppc-morphos-gcc cross build).
+  `class_version.h`, `recognize.c`, `Makefile` (ppc-morphos-gcc cross build),
+  `avif.demuxer.doc` (Autodoc: one section per tag, `\f` page breaks, same
+  layout as `../sonix_stream/demuxer/sonix.demuxer.doc`).
 - avif.decoder: files `avif_decoder/avif.decoder.c`, `avif.decoder.h`,
-  `class_version.h`, `data.c`, `Makefile`, plus `avif_decoder/dav1d/`
+  `class_version.h`, `data.c`, `Makefile`, `avif.decoder.doc`, plus
+  `avif_decoder/dav1d/`
   (vendored sources, BSD-2 licence COPYING, hand-written config), built as a
   static archive `libdav1d.a` and linked into the plugin. Host verification
   via stub headers under `/tmp/opencode/medhdr/` (as used by octamed) + an
   integration test that parses a tiny AVIF and decodes its frames.
   A copy of the demuxer's public header `avif.demuxer.h` is shared through
   `../avif_demuxer/avif.demuxer.h`.
+
+## Host verification harness
+
+Outside the repo, in `/tmp/opencode/hostbuild` (see the session notes; a
+`HOST_64BIT_LONG` build define is required or the 32-bit SDK stubs truncate
+pointers):
+
+- `build.sh` - regenerate stub headers, build `demux_test` / `decoder_test`
+  from the plugin sources, syntax-lint the sources, build the vendored dav1d
+  archive.
+- `refdump.c` - dumps reference planes using a **system** libdav1d, the
+  independent ground truth; `compare.py` does the colour maths separately.
+- `run_corpus.sh` - demux, decode and compare every corpus sample.
+- `mksynth.py` / `run_synth.sh` - synthetic containers for parser corner cases,
+  including the cases that must be rejected.
+- `inject_nclx.py` - swap an `colr` ICC property for a synthetic nclx.
+- `recognise_test.c` / `brands.py` - run `recognize.c`'s `Recognize()` and
+  compare its verdict with `parse_ftyp()` over a brand matrix.
+- `fuzz.py` - container and elementary-stream mutation fuzzing.
 
 ## Work state / next steps
 
@@ -197,4 +226,11 @@ premultiplied); single-plane AVIF only. Attributes on Get/GetPort:
 - [x] Push both plugins to GitHub as the `avif` repo (polluks/avif,
       `avif_demuxer/` + `avif_decoder/`)
 - [ ] Verify on real MorphOS hardware (needs ppc-morphos-gcc + Reggae SDK)
-- [ ] Write Autodocs `avif.demuxer.doc` and `avif.demuxer.doc`
+- [x] Write Autodocs `avif.demuxer.doc` and `avif.decoder.doc`
+- [x] Host audit: 24-sample corpus vs libdav1d reference (all bit depths,
+      monochrome, 4:2:0/4:2:2/4:4:4, alpha exact), nclx override, synthetic
+      parser suite (25 cases), brand matrix (98 combos over 32 and 64 bit
+      `ftyp`, recognise and demux agree), container and ES fuzzing,
+      arbitrary pull sizes
+- [x] Fix parser bugs found by the audit: `iloc` `index_size` for v1,
+      construction method nibble, 64-bit `ftyp`/`meta` headers, brand rule

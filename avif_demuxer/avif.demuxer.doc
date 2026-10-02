@@ -1,0 +1,357 @@
+TABLE OF CONTENTS
+
+avif.demuxer/--background--
+avif.demuxer/AVIF_META_DATA
+avif.demuxer/MMA_DataFormat
+avif.demuxer/MMA_ExtraData
+avif.demuxer/MMA_MediaType
+avif.demuxer/MMA_Video_BitsPerPixel
+avif.demuxer/MMA_Video_FrameCount
+avif.demuxer/MMA_Video_Height
+avif.demuxer/MMA_Video_UseAlpha
+avif.demuxer/MMA_Video_Width
+avif.demuxer/MMM_Pull
+avif.demuxer/--background--
+
+ DESCRIPTION
+   A Reggae demultiplexer for AVIF (AV1 Image File Format) files. It parses
+   the ISO Base Media File Format box structure of a file, takes the primary
+   image item apart and hands the AV1 bitstream of that item on as
+   MMF_VIDEO_AVIF, together with the geometry, the bit depth, the alpha flag
+   and whatever metadata it found.
+
+   Input port 0 carries MMF_STREAM and is a source stream in front of it,
+   normally file.stream. Output port 1 carries MMF_VIDEO_AVIF, the AV1 OBU
+   stream of the image, which avif.decoder takes on its input port 0 and
+   decodes to MMFC_VIDEO_ARGB32. The identifier lives in avif.demuxer.h.
+
+   Everything is parsed on MMM_Setup on port 0. The parse walks the top level
+   boxes looking for ftyp and meta, buffers the meta box, reads pitm, iinf,
+   iloc, iref and iprp out of it, resolves the ispe, pixi, av1C, colr and
+   auxC properties of the primary item, finds the alpha item and the XMP
+   item, and finally assembles the bitstream by seeking to each extent of the
+   item in the input and pulling it. The bitstream is then kept in memory, so
+   the file is not touched again: MMM_Pull on port 1 only copies out of that
+   buffer.
+
+   The geometry is therefore only known after port 0 has been set up. Before
+   that, MMA_Video_Width, MMA_Video_Height and MMA_Video_BitsPerPixel are 0
+   and MMA_Video_UseAlpha is FALSE. An application which wants to size its
+   buffers beforehand has to set port 0 up before it can ask for the width.
+
+   Setting port 0 up again parses the file from scratch: the previous result
+   is dropped, so the pull position on port 1 starts at the beginning of the
+   new bitstream and a struct AvifInfo handed out earlier is freed. Asking for
+   a geometry attribute is not a substitute for the setup, it only reads what
+   the parse has left behind.
+
+   The class needs a source which knows how long it is. The length of the
+   input (MMA_StreamLength) bounds every box and every extent that is read,
+   so a source which reports 0, or a stream shorter than 16 bytes, is refused
+   with MMERR_END_OF_DATA. A file with no ftyp box, no meta box, a corrupt
+   meta box, no primary item reference, a primary item which is not an "av01"
+   item or has no ispe property, or an item location this class cannot
+   resolve, is refused with MMERR_WRONG_DATA. A meta box above 16 MB, a
+   bitstream above 64 MB or a failed allocation is MMERR_OUT_OF_MEMORY, and a
+   source which cannot seek or comes up short is MMERR_IO_ERROR.
+
+   The bitstream on port 1 is the item data as it is stored: the extents
+   concatenated in the order the location box lists them. The av1C box is a
+   codec configuration record and not an OBU, so it is never prepended to it;
+   ai_Av1c in MMA_ExtraData carries it for an application which wants to see
+   it. A conforming file begins the item with an OBU sequence header, and a
+   stream which does not is logged as a warning but still handed out.
+
+   An image with alpha is coded as a second AV1 item, and that item is not
+   emitted on port 1 either: it reaches avif.decoder through MMA_ExtraData,
+   which is the only path between the two classes. This class only ever
+   reports one frame, so an animated file ('avis') gives the item its primary
+   reference names and nothing else. Derived items ('Grid') are not decoded:
+   a primary item which is not an AV1 item is refused.
+
+   The class implements no seeking. Nothing is maintained for
+   MMA_StreamPosFrames or MMA_StreamPosTime, and MMM_Seek on port 1 is left to
+   multimedia.class.
+
+   The recognition code of this class accepts a file whose first box is ftyp
+   and whose major brand, or one of whose compatible brands, is "avif",
+   "avis", "avio" or "mif1". The compatible brands are checked because
+   encoders may use a generic major brand and only list AVIF among the brands
+   the file is compatible with. It reports 9500, plus 500 when the stream is
+   at least as long as the ftyp box.
+
+   Parsing is bounded: at most 64 items, 64 properties, 32 properties per
+   item and 16 extents per item are looked at, which is far above what real
+   files use and keeps a corrupt file from asking for an arbitrary
+   allocation. The meta box is only buffered up to 16 MB and an assembled
+   bitstream only up to 64 MB.
+
+ NEW ATTRIBUTES
+   Attributes applicability:
+     I - may be set at creation time.
+     S - may be set on an existing object.
+     G - may be get from an object.
+     P - may be set for an object's port.
+     Q - may be queried from an object's port.
+
+   AVIF_META_DATA         (V1)    [..G.Q], struct AvifMetaData*
+   MMA_DataFormat         (V1)    [..G.Q], STRPTR
+   MMA_ExtraData          (V1)    [..G.Q], struct AvifInfo*
+   MMA_MediaType          (V1)    [..G.Q], ULONG
+   MMA_Video_BitsPerPixel (V1)    [..G.Q], ULONG
+   MMA_Video_FrameCount   (V1)    [..G.Q], LONG
+   MMA_Video_Height       (V1)    [..G.Q], LONG
+   MMA_Video_UseAlpha     (V1)    [..G.Q], BOOL
+   MMA_Video_Width        (V1)    [..G.Q], LONG
+
+   All of them answer the parse which MMM_Setup on port 0 has done. None of
+   them may be set.
+
+ NEW METHODS
+   MMM_Pull(port, buffer, length)  (V1)
+
+ HISTORY
+   1.1 (15.09.2026)
+   - Initial release.
+
+avif.demuxer/AVIF_META_DATA
+
+ NAME
+   AVIF_META_DATA (V1) [..G.Q], struct AvifMetaData*
+
+ FUNCTION
+   Returns a pointer to the metadata strings this class has extracted from the
+   file. amd_Count of the amd_Entries are valid; amd_Entries[i].ame_Tag is
+   AVIF_META_TITLE, AVIF_META_COPYRIGHT or AVIF_META_DESCRIPTION, and
+   amd_Entries[i].ame_String is a NUL terminated string owned by this object.
+
+   The strings come from the XMP packet of the file, which is looked for as a
+   "mime" item with the content type application/rdf+xml. amd_Count is 0 when
+   the file carries no such item, or when it carries one with none of the
+   three properties in it.
+
+ NOTES
+   This is a private attribute of this class, defined in avif.demuxer.h and
+   not published in the attribute list of the library, so an application has
+   to ask for the tag by name.
+
+   Only dc:title, dc:rights and dc:description are looked for, in both the
+   forms encoders write them in: as an attribute of rdf:Description
+   (dc:title="...") and as an element holding an rdf:Alt or rdf:Bag list
+   (<dc:title><rdf:Alt><rdf:li xml:lang="x-default">...</rdf:li>...
+   </rdf:Alt></dc:title>). A string is stored as it stands, without being
+   unescaped or translated, and at most 8 entries of 256 bytes each are kept.
+
+   The struct is owned by this object and is freed when the object is
+   disposed or when port 0 is set up again. Copy what is needed out of it
+   rather than keeping the pointer.
+
+   MMA_MetaData is not used for this. Its storage layout is not visible from
+   this repository, so this class does not guess at it.
+
+ SEE ALSO
+   avif.demuxer/MMA_ExtraData
+
+avif.demuxer/MMA_DataFormat
+
+ NAME
+   MMA_DataFormat (V1) [..G.Q], STRPTR
+
+ FUNCTION
+   Returns "AVIF" as a string constant. It names the format of the data on
+   the ports rather than anything read from the file, and does not change.
+
+ SEE ALSO
+   avif.demuxer/MMA_MediaType
+
+avif.demuxer/MMA_ExtraData
+
+ NAME
+   MMA_ExtraData (V1) [..G.Q], struct AvifInfo*
+
+ FUNCTION
+   Returns a pointer to the struct AvifInfo which describes the image and owns
+   the bitstreams. This is what avif.decoder reads on its setup: the struct
+   carries the geometry and the colour signalling the decoder needs, and the
+   two AV1 streams it has to decode.
+
+   ai_Width, ai_Height and ai_BitsPerPixel are the geometry and the luma bit
+   depth of the image. ai_UseAlpha is TRUE when the file codes the alpha
+   channel as a separate item, ai_AlphaPremul when the colour planes were
+   premultiplied, ai_Monochrome for a single plane image, and ai_ChromaSubX
+   and ai_ChromaSubY the chroma subsampling. ai_ES and ai_ESLength are the
+   colour plane OBU stream, ai_AlphaES and ai_AlphaESLength the alpha plane
+   one, which are NULL and 0 when the image has no separate alpha. ai_HaveNclx
+   says whether the colour fields after it mean anything: ai_ColourPrimaries,
+   ai_TransferCharacteristics and ai_MatrixCoefficients are ITU-T H.273 code
+   points and ai_FullRangeFlag is the range flag, all as the colr box of the
+   file has them. ai_Av1c and ai_Av1cLength are the
+   AV1CodecConfigurationRecord of the image.
+
+ NOTES
+   The struct belongs to this object. It is allocated on setup, freed on
+   dispose, and replaced by the next setup of port 0; ai_ES and ai_AlphaES
+   point into memory this object owns and must not be freed or written to.
+
+   The pull position is kept in the object and not in the struct, so ai_ES
+   always covers the whole stream and asking for this attribute twice returns
+   the same stream both times.
+
+   The value is a pointer, so it has to be fetched through a storage pointer
+   (MediaGetPort() or MediaGetPortFwd() on the input port, or a GetAttr()
+   with a pointer as its storage): it cannot be carried in the 32 bit return
+   value of a MorphOS method call.
+
+   The definition is in avif.demuxer.h.
+
+ SEE ALSO
+   avif.demuxer/AVIF_META_DATA, avif.decoder/MMM_Pull
+
+avif.demuxer/MMA_MediaType
+
+ NAME
+   MMA_MediaType (V1) [..G.Q], ULONG
+
+ FUNCTION
+   Returns MMT_PICTURE. AVIF still images are pictures and this class always
+   reports one of them.
+
+avif.demuxer/MMA_Video_BitsPerPixel
+
+ NAME
+   MMA_Video_BitsPerPixel (V1) [..G.Q], ULONG
+
+ FUNCTION
+   Luma bit depth of the coded image: 8, 10 or 12. It is taken from the pixi
+   property of the image where the file has one and from its av1C box
+   otherwise, and it is 0 until port 0 has been set up.
+
+ NOTES
+   This is the depth the image is coded with, not a pixel size of an output
+   format. Port 1 carries the coded stream, which has no pixels at all; an
+   application which wants the depth of the pixels it ends up with has to ask
+   the decoder on the other side of the pipeline.
+
+   An alpha item is coded separately and may have its own depth, which this
+   class does not report separately. The decoder reads it from the stream.
+
+ SEE ALSO
+   avif.demuxer/MMA_Video_Width, avif.decoder/MMA_Video_BitsPerPixel
+
+avif.demuxer/MMA_Video_FrameCount
+
+ NAME
+   MMA_Video_FrameCount (V1) [..G.Q], LONG
+
+ FUNCTION
+   Returns 1, and 1 also before port 0 has been set up. A file gives one
+   image, and an animated one gives the image its primary item reference
+   names, which is why the count is never anything else.
+
+ NOTES
+   On MorphOS the multimedia framework stores this attribute in a LONG, and
+   this class writes it as one. A QUAD variable on the receiving side is fine,
+   but do not let the framework write a UQUAD into it: use the 32 bit form of
+   the attribute macro.
+
+avif.demuxer/MMA_Video_Height
+
+ NAME
+   MMA_Video_Height (V1) [..G.Q], LONG
+
+ FUNCTION
+   Height of the image in pixels, from the ispe property of the primary item,
+   and 0 until port 0 has been set up. The property is not optional: a file
+   whose primary item has none is refused with MMERR_WRONG_DATA, so a
+   successful setup always leaves a usable value here.
+
+   This is the height of the coded image, which is the height of the decoded
+   picture as well.
+
+ SEE ALSO
+   avif.demuxer/MMA_Video_Width, avif.decoder/MMA_Video_Height
+
+avif.demuxer/MMA_Video_UseAlpha
+
+ NAME
+   MMA_Video_UseAlpha (V1) [..G.Q], BOOL
+
+ FUNCTION
+   TRUE when the image has an alpha channel which is coded as an item of its
+   own, FALSE otherwise and before port 0 has been set up. Such an item is
+   recognised by the auxiliary type urn of its auxC property, or, when no
+   item carries that urn, by being the item an 'auxl' reference of the primary
+   item points at.
+
+ NOTES
+   An image whose alpha was premultiplied into the colour planes has no
+   separate alpha item and reports FALSE here, even though it is an image
+   with alpha. The premultiplied flag itself is in ai_AlphaPremul of
+   MMA_ExtraData.
+
+   The alpha stream is not emitted on port 1. It travels to avif.decoder
+   through ai_AlphaES in MMA_ExtraData, which is the only path between the
+   two classes, so an application which decodes AVIF itself has to take it
+   from there.
+
+ SEE ALSO
+   avif.demuxer/MMA_ExtraData, avif.decoder/MMA_Video_UseAlpha
+
+avif.demuxer/MMA_Video_Width
+
+ NAME
+   MMA_Video_Width (V1) [..G.Q], LONG
+
+ FUNCTION
+   Width of the image in pixels, from the ispe property of the primary item,
+   and 0 until port 0 has been set up. The property is not optional: a file
+   whose primary item has none is refused with MMERR_WRONG_DATA, so a
+   successful setup always leaves a usable value here.
+
+   This is the width of the coded image, which is the width of the decoded
+   picture as well.
+
+ SEE ALSO
+   avif.demuxer/MMA_Video_Height, avif.decoder/MMA_Video_Width
+
+avif.demuxer/MMM_Pull
+
+ NAME
+   MMM_Pull -- Pulls the AV1 elementary stream out of an AVIF file. (V1)
+
+ SYNOPSIS
+   ULONG DoMethod(Object *obj, MMM_Pull, ULONG port, APTR buffer, ULONG
+   length);
+
+ FUNCTION
+   Port 1 hands out the AV1 OBU stream of the primary image item: the bytes of
+   its extents in the order the location box lists them. They were copied out
+   of the file during MMM_Setup on port 0, so the pull neither reads nor seeks
+   the source. A pull returns as much of the rest of the stream as fits into
+   length and a short count when the end of it is in the way; once the last
+   byte has been handed out a pull returns 0 and reports MMERR_END_OF_DATA
+   through MMA_ErrorCode. A pull on port 1 before port 0 has been set up
+   answers the same way, because there is nothing to hand out yet.
+
+   Port 0 is a passthrough to the source stream and returns the raw file.
+   That is what the recognition code of this class uses to find the ftyp box,
+   and the class restores what it peeked at. The passthrough is there for
+   applications which want the file itself, not for this class: it reads the
+   file through port 0 during its setup.
+
+   A NULL buffer, a length of 0 or a port other than 0 or 1 is refused with
+   MMERR_WRONG_ARGUMENTS.
+
+ INPUTS
+   obj - object to perform method on.
+   port - number of port, 0 for the raw file or 1 for the AV1 stream.
+   buffer - destination buffer for the data.
+   length - amount of data to be pulled in *bytes*.
+
+ RESULT
+   Number of bytes pulled, secondary error information via MMA_ErrorCode.
+
+ SEE ALSO
+   multimedia.class/MMA_ErrorCode, avif.decoder/MMM_Pull
+
+

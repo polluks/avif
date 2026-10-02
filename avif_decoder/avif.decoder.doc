@@ -1,0 +1,262 @@
+TABLE OF CONTENTS
+
+avif.decoder/--background--
+avif.decoder/MMA_DataFormat
+avif.decoder/MMA_MediaType
+avif.decoder/MMA_Video_BitsPerPixel
+avif.decoder/MMA_Video_FrameCount
+avif.decoder/MMA_Video_Height
+avif.decoder/MMA_Video_UseAlpha
+avif.decoder/MMA_Video_Width
+avif.decoder/MMM_Pull
+avif.decoder/--background--
+
+ DESCRIPTION
+   A Reggae decoder for AVIF (AV1 Image File Format) images. Input port 0
+   takes the AV1 elementary stream in the format MMF_VIDEO_AVIF, which is
+   what avif.demuxer produces, and output port 1 produces MMFC_VIDEO_ARGB32:
+   one frame of four bytes per pixel, alpha first, top row first, with no
+   padding between rows.
+
+   The bitstream is decoded with dav1d, which is bundled into this library.
+   MorphOS has no AV1 decoder of its own, so nothing has to be installed
+   besides this library and avif.demuxer. The decoder is built as portable C
+   for the 604e, without assembly and without threads, and decodes one stream
+   at a time with film grain synthesis and all in loop filters enabled, which
+   is what libavif and avifdec render.
+
+   MMM_Setup on port 0 reads the geometry and the bitstream out of the struct
+   AvifInfo which the demuxer publishes through MMA_ExtraData, and copies the
+   streams so that the decoder does not depend on the demuxer's buffers
+   staying alive. This is the only initialisation path, and it is done once:
+   whichever of the setup on port 0 and the first pull on port 1 happens first
+   does the work.
+
+   The setup needs the demuxer to have been set up first, because until then
+   there is no AvifInfo to read and MMA_ExtraData answers with nothing. A
+   decoder which is set up before the demuxer is recoverable as long as the
+   pipeline is complete before the first pixel is pulled: the setup fails, and
+   the first pull on port 1 tries again and succeeds. The same goes for an
+   input which is not an avif.demuxer: nothing publishes an AvifInfo, so there
+   is nothing this class can do with the stream.
+
+   The setup does not decode. Decoding happens on the first pull on port 1
+   and is never repeated, so the whole picture is decoded and converted into
+   one bitmap of width times height times four bytes before the first byte
+   comes out. That first pull is where the decode time shows up.
+
+   Colour conversion is done here, in scalar C. The samples are scaled to 16
+   bit full range, converted with integer coefficients and reduced to the high
+   byte, which keeps the 10 and 12 bit paths from throwing away precision
+   before the matrix has been applied. The matrix is the one the container
+   names in its nclx colour property when the file has one, and the one the
+   sequence header names otherwise: the container wins, because it describes
+   the colour the image was encoded in. BT.709, BT.2020, BT.601 and BT.470,
+   FCC and the H.273 identity matrix are all handled, in full and in limited
+   range, and BT.601 is the fallback for anything else. A monochrome image is
+   converted from luma alone, and the chroma of a 4:2:0 or 4:2:2 image is
+   upsampled bilinearly, since the chroma samples are co-sited with the top
+   left luma sample of the block they cover and a plain shift leaves blocky
+   edges.
+
+   An image with a separately coded alpha plane is decoded by a second dav1d
+   instance, and its single plane becomes the alpha byte. ARGB32 carries
+   straight alpha, so the colour is left alone; an image whose colour planes
+   were premultiplied is handed on as it is. An alpha stream which does not
+   decode is not fatal: the image comes out opaque.
+
+   The first picture of the stream is decoded and nothing else, so
+   MMA_Video_FrameCount is always 1 and animation is not handled. The class
+   implements no seeking.
+
+ NEW ATTRIBUTES
+   Attributes applicability:
+     I - may be set at creation time.
+     S - may be set on an existing object.
+     G - may be get from an object.
+     P - may be set for an object's port.
+     Q - may be queried from an object's port.
+
+   MMA_DataFormat         (V1)    [..G.Q], STRPTR
+   MMA_MediaType          (V1)    [..G.Q], ULONG
+   MMA_Video_BitsPerPixel (V1)    [..G.Q], ULONG
+   MMA_Video_FrameCount   (V1)    [..G.Q], LONG
+   MMA_Video_Height       (V1)    [..G.Q], LONG
+   MMA_Video_UseAlpha     (V1)    [..G.Q], BOOL
+   MMA_Video_Width        (V1)    [..G.Q], LONG
+
+   All of them answer what the input published when this class took its data
+   in. None of them may be set.
+
+ NEW METHODS
+   MMM_Pull(port, buffer, length)  (V1)
+
+ HISTORY
+   1.1 (15.09.2026)
+   - Initial release.
+
+avif.decoder/MMA_DataFormat
+
+ NAME
+   MMA_DataFormat (V1) [..G.Q], STRPTR
+
+ FUNCTION
+   Returns "AVIF" as a string constant. It names the format the image came
+   in, not the format of the output, and does not change.
+
+ SEE ALSO
+   avif.decoder/MMA_MediaType
+
+avif.decoder/MMA_MediaType
+
+ NAME
+   MMA_MediaType (V1) [..G.Q], ULONG
+
+ FUNCTION
+   Returns MMT_PICTURE. The decoder produces one still image and never more.
+
+avif.decoder/MMA_Video_BitsPerPixel
+
+ NAME
+   MMA_Video_BitsPerPixel (V1) [..G.Q], ULONG
+
+ FUNCTION
+   Luma bit depth the image was coded with: 8, 10 or 12, as published by the
+   demuxer, and 0 until this class has taken its data in.
+
+ NOTES
+   This is the depth of the coded image, not of the output. Port 1 is
+   MMFC_VIDEO_ARGB32, which is eight bits per channel whatever this says: a
+   10 or 12 bit image is reduced to 8 bits per channel here, in the colour
+   conversion, by scaling the samples onto the full range rather than by
+   dropping their low bytes.
+
+ SEE ALSO
+   avif.decoder/MMA_Video_Width, avif.demuxer/MMA_Video_BitsPerPixel
+
+avif.decoder/MMA_Video_FrameCount
+
+ NAME
+   MMA_Video_FrameCount (V1) [..G.Q], LONG
+
+ FUNCTION
+   Returns 1, and 1 also before the data has been taken in. Only the first
+   picture of the stream is decoded, so there is nothing to count beyond it.
+
+ NOTES
+   On MorphOS the multimedia framework stores this attribute in a LONG, and
+   this class writes it as one. A QUAD variable on the receiving side is fine,
+   but do not let the framework write a UQUAD into it: use the 32 bit form of
+   the attribute macro.
+
+avif.decoder/MMA_Video_Height
+
+ NAME
+   MMA_Video_Height (V1) [..G.Q], LONG
+
+ FUNCTION
+   Height of the decoded picture in pixels, as published by the demuxer, and 0
+   until this class has taken its data in. A geometry of 0 or of 65536 and
+   more is refused, since neither can be a picture this class can decode.
+
+   The decoded picture has to come out at the published height. A picture
+   which comes out at another size fails the conversion, and the pull which
+   triggers the decode returns 0.
+
+ SEE ALSO
+   avif.decoder/MMA_Video_Width, avif.demuxer/MMA_Video_Height
+
+avif.decoder/MMA_Video_UseAlpha
+
+ NAME
+   MMA_Video_UseAlpha (V1) [..G.Q], BOOL
+
+ FUNCTION
+   TRUE when the image codes its alpha channel as an item of its own, as
+   published by the demuxer, and FALSE otherwise and before this class has
+   taken its data in.
+
+ NOTES
+   The pixels on port 1 always have an alpha byte, whether this says TRUE or
+   not: without an alpha item it is 255 in every pixel.
+
+   An image whose alpha was premultiplied into the colour planes has no
+   separate alpha item and reports FALSE. Nothing is done to the colour in
+   that case either: ARGB32 carries straight alpha, and a premultiplied image
+   is handed on with its colour already scaled.
+
+ SEE ALSO
+   avif.demuxer/MMA_ExtraData, avif.demuxer/MMA_Video_UseAlpha
+
+avif.decoder/MMA_Video_Width
+
+ NAME
+   MMA_Video_Width (V1) [..G.Q], LONG
+
+ FUNCTION
+   Width of the decoded picture in pixels, as published by the demuxer, and 0
+   until this class has taken its data in. A geometry of 0 or of 65536 and
+   more is refused, since neither can be a picture this class can decode.
+
+   The decoded picture has to come out at the published width. A picture
+   which comes out at another size fails the conversion, and the pull which
+   triggers the decode returns 0.
+
+ SEE ALSO
+   avif.decoder/MMA_Video_Height, avif.demuxer/MMA_Video_Width
+
+avif.decoder/MMM_Pull
+
+ NAME
+   MMM_Pull -- Pulls the decoded picture in ARGB32. (V1)
+
+ SYNOPSIS
+   ULONG DoMethod(Object *obj, MMM_Pull, ULONG port, APTR buffer, ULONG
+   length);
+
+ FUNCTION
+   Port 1 hands out the decoded picture: four bytes per pixel, alpha, red,
+   green, blue, top row first, tightly packed and with no padding between
+   rows. The read position is in the object, so a picture can be pulled in as
+   many pieces as the consumer wants, and a short count is returned when the
+   end of the picture is in the way. Once the last pixel has been handed out a
+   pull returns 0 and reports MMERR_END_OF_DATA through MMA_ErrorCode.
+
+   The length is rounded down to whole pixels. A length too short for a
+   single pixel cannot be satisfied and is refused with
+   MMERR_WRONG_ARGUMENTS rather than writing four bytes into a buffer which
+   cannot hold them.
+
+   The first pull on port 1 is where the picture is decoded: it takes the
+   data in if nothing has done so yet, runs dav1d over the colour stream and
+   over the alpha stream if there is one, and converts the result into the
+   whole bitmap before any of it is handed out. Later pulls only copy.
+
+   A pull which cannot produce data returns 0 and says why through
+   MMA_ErrorCode: an input which publishes no AvifInfo is
+   MMERR_NO_STREAM, a refused geometry, a stream dav1d will not decode or a
+   picture whose size does not match the published geometry is
+   MMERR_WRONG_DATA, and a failed allocation is MMERR_OUT_OF_MEMORY. Each of
+   them is written to the plugin log as well, so a short pull tells a consumer
+   that the picture ends there and an error code tells it why.
+
+   Port 0 is a passthrough to the input stream. This class does not use it:
+   the picture is decoded out of the data avif.demuxer published, not out of
+   what is pulled through the port.
+
+   A NULL buffer, a length of 0 or a port other than 0 or 1 is refused with
+   MMERR_WRONG_ARGUMENTS.
+
+ INPUTS
+   obj - object to perform method on.
+   port - number of port, 0 for the passthrough or 1 for the picture.
+   buffer - destination buffer for the data.
+   length - amount of data to be pulled in *bytes*.
+
+ RESULT
+   Number of bytes pulled, secondary error information via MMA_ErrorCode.
+
+ SEE ALSO
+   multimedia.class/MMA_ErrorCode, avif.demuxer/MMM_Pull
+
+

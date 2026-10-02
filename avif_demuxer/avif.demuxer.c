@@ -483,7 +483,7 @@ static const struct TagItem RTags[] =
 	{QUERYINFOATTR_IDSTRING, (ULONG)&VTag[1]},
 	{QUERYINFOATTR_DESCRIPTION, (ULONG)"AVIF fileformat demuxer"},
 	{QUERYINFOATTR_COPYRIGHT, (ULONG)"(c) 2026"},
-	{QUERYINFOATTR_AUTHOR, (ULONG)"Reggae contributors"},
+	{QUERYINFOATTR_AUTHOR, (ULONG)"Big Pickle"},
 	{QUERYINFOATTR_DATE, (ULONG)DATE},
 	{QUERYINFOATTR_VERSION, VERSION},
 	{QUERYINFOATTR_REVISION, REVISION},
@@ -713,32 +713,30 @@ Class *GetClass(VOID)
 }
 
 ///
-/// GetHeader() - parse AVIF ISOBMFF and build ObjData
+/// parse an 'ftyp' box payload and decide whether it describes an AVIF file.
 ///
-/// Reads all top-level boxes from the stream, parses the ISOBMFF meta
-/// hierarchy to find the primary item, its extents (iloc), dimensions
-/// (ispe), codec config (av1C), and the image item's elementary data
-/// in the mdat box.  Assembles the complete AV1 elementary stream.
-
+/// The brands are the ones libavif accepts (src/read.c, avifCheckAVIFBrand):
+/// a major brand of 'avif', 'avis' or 'avio', or 'avif' or 'avis' anywhere in
+/// the compatible brand list, which is what an encoder using a generic major
+/// brand such as 'mif1' or 'heic' looks like.  recognize.c applies the same
+/// rule, so a file the recogniser claims is a file the parser accepts.
+///
+/// A 'mif1' or 'heic' major brand on its own is not enough: such a file may
+/// be plain HEIF with no AV1 items at all.
+///
 static BOOL parse_ftyp(struct MemCtx *mc, ULONG box_size)
 {
 	UBYTE major[4];
 	UBYTE compat[4];
-	BOOL found = FALSE;
 
 	if (box_size < 8) return FALSE;
 
-	/* major_brand */
+	/* major_brand, then the 4 byte minor version */
 	if (!mc_read(mc, major, 4)) return FALSE;
-	if (mc_read(mc, compat, 4)) /* minor_version, 4 bytes */
-	{
-		/* accept the AVIF major brands directly */
-		if (!memcmp(major, "avif", 4) || !memcmp(major, "avis", 4) ||
-		    !memcmp(major, "avio", 4) || !memcmp(major, "mif1", 4))
-		{
-			found = TRUE;
-		}
-	}
+	if (!mc_skip(mc, 4)) return FALSE;
+
+	if (!memcmp(major, "avif", 4) || !memcmp(major, "avis", 4) ||
+	    !memcmp(major, "avio", 4)) return TRUE;
 
 	/* compatible_brands */
 	while (mc_remaining(mc) >= 4)
@@ -746,11 +744,11 @@ static BOOL parse_ftyp(struct MemCtx *mc, ULONG box_size)
 		if (!mc_read(mc, compat, 4)) break;
 		if (!memcmp(compat, "avif", 4) || !memcmp(compat, "avis", 4))
 		{
-			found = TRUE;
+			return TRUE;
 		}
 	}
 
-	return found;
+	return FALSE;
 }
 
 ///
@@ -796,7 +794,7 @@ static BOOL parse_ipco(struct MemCtx *mc, struct ParsedProp *props,
 		}
 		else
 		{
-			MLOGV(LOG_WARN, "Too many ipco properties, ignoring box.");
+			MLOG(LOG_INFO, "Too many ipco properties, ignoring box.");
 		}
 
 		/* advance past the whole box, header included */
@@ -897,14 +895,14 @@ static BOOL build_elementary_stream(Class *cl, Object *obj, struct ObjData *d,
 
 	if (!item)
 	{
-		MLOG(LOG_ERRORS, "Item %lu not found in item list.", (ULONG)item_id);
+		MLOGV(LOG_ERRORS, "Item %lu not found in item list.", (ULONG)item_id);
 		*err = MMERR_WRONG_DATA;
 		return FALSE;
 	}
 
 	if (!item->id_HasLocation || item->id_NumExtents == 0)
 	{
-		MLOG(LOG_ERRORS, "Item %lu has no location info.", (ULONG)item_id);
+		MLOGV(LOG_ERRORS, "Item %lu has no location info.", (ULONG)item_id);
 		*err = MMERR_WRONG_DATA;
 		return FALSE;
 	}
@@ -917,7 +915,7 @@ static BOOL build_elementary_stream(Class *cl, Object *obj, struct ObjData *d,
 
 		if (!extent_is_valid(offset, length, stream_length))
 		{
-			MLOG(LOG_ERRORS, "Extent %lu out of stream bounds.", i);
+			MLOGV(LOG_ERRORS, "Extent %lu out of stream bounds.", i);
 			*err = MMERR_WRONG_DATA;
 			return FALSE;
 		}
@@ -959,13 +957,13 @@ static BOOL build_elementary_stream(Class *cl, Object *obj, struct ObjData *d,
 
 		if (DoMethod(obj, MMM_Seek, 0, MMM_SEEK_BYTES, &offset) != 1)
 		{
-			MLOG(LOG_ERRORS, "Seek to extent %lu failed.", i);
+			MLOGV(LOG_ERRORS, "Seek to extent %lu failed.", i);
 			goto fail_io;
 		}
 
 		if (DoMethod(obj, MMM_Pull, 0, (ULONG)(*out_buf + es_pos), length) != length)
 		{
-			MLOG(LOG_ERRORS, "Short read on extent %lu.", i);
+			MLOGV(LOG_ERRORS, "Short read on extent %lu.", i);
 			goto fail_io;
 		}
 		es_pos += length;
@@ -980,7 +978,7 @@ static BOOL build_elementary_stream(Class *cl, Object *obj, struct ObjData *d,
 	 */
 	if (item->id_IsAv01 && !es_has_sequence_header(*out_buf, *out_len))
 	{
-		MLOGV(LOG_WARN, "av01 item has no sequence header OBU.");
+		MLOG(LOG_INFO, "av01 item has no sequence header OBU.");
 	}
 
 	return TRUE;
@@ -1228,7 +1226,14 @@ static BOOL parse_iloc(struct MemCtx *mc, struct ObjData *d, UQUAD stream_length
 	base_offset_size = (sizes[1] >> 4) & 0x0F;
 	index_size       = sizes[1] & 0x0F;
 
-	if (version < 2) index_size = 0;
+	/*
+	 * index_size shares its byte with a reserved field in version 0, so it
+	 * only exists from version 1 on.  Honouring it in version 1 matters:
+	 * every extent of a version 1 box then carries an extra item reference
+	 * index that has to be stepped over, and skipping it would shift all
+	 * following extents and item IDs.
+	 */
+	if (version < 1) index_size = 0;
 
 	if (offset_size > 8 || length_size > 8 ||
 	    base_offset_size > 8 || index_size > 8) return FALSE;
@@ -1253,9 +1258,17 @@ static BOOL parse_iloc(struct MemCtx *mc, struct ObjData *d, UQUAD stream_length
 
 		if (version >= 1)
 		{
+			/*
+			 * reserved(12) followed by construction_method(4) in one
+			 * 16 bit field, so the method is the low nibble.  Reading
+			 * it as the high nibble would see the always zero reserved
+			 * field and silently treat every construction method as 0,
+			 * which means reading item data from the wrong offset
+			 * instead of refusing the file.
+			 */
 			UQUAD v;
 			if (!mc_read_uint(mc, 2, &v)) return FALSE;
-			construction = (ULONG)((v >> 12) & 0x0F);
+			construction = (ULONG)(v & 0x0F);
 		}
 
 		/* data_reference_index */
@@ -1277,7 +1290,7 @@ static BOOL parse_iloc(struct MemCtx *mc, struct ObjData *d, UQUAD stream_length
 			 * more context than we keep.  Reject them rather than
 			 * silently reading from the wrong offset.
 			 */
-			MLOGV(LOG_WARN, "iloc item %lu: construction method %lu unsupported.",
+			MLOGV(LOG_INFO, "iloc item %lu: construction method %lu unsupported.",
 			      (ULONG)item_id, construction);
 			return FALSE;
 		}
@@ -1305,7 +1318,7 @@ static BOOL parse_iloc(struct MemCtx *mc, struct ObjData *d, UQUAD stream_length
 			/* construction method 0: file offset is base + extent offset */
 			if (base_offset > (UQUAD)~0ULL - offset)
 			{
-				MLOGV(LOG_WARN, "iloc item %lu extent %lu offset overflow.",
+				MLOGV(LOG_INFO, "iloc item %lu extent %lu offset overflow.",
 				      (ULONG)item_id, (ULONG)e);
 				return FALSE;
 			}
@@ -1313,7 +1326,7 @@ static BOOL parse_iloc(struct MemCtx *mc, struct ObjData *d, UQUAD stream_length
 
 			if (!extent_is_valid(offset, length, stream_length))
 			{
-				MLOGV(LOG_WARN, "iloc item %lu extent %lu out of bounds.",
+				MLOGV(LOG_INFO, "iloc item %lu extent %lu out of bounds.",
 				      (ULONG)item_id, (ULONG)e);
 				return FALSE;
 			}
@@ -1479,7 +1492,7 @@ static BOOL parse_iref(struct MemCtx *mc, struct ObjData *d, ULONG iref_end)
 
 		if (payload < from_size + 2)
 		{
-			MLOGV(LOG_WARN, "iref '%s' is too short.", type);
+			MLOGV(LOG_INFO, "iref '%.4s' is too short.", (STRPTR)type);
 		}
 		else if (!mc_read_uint(mc, from_size, &from_id) ||
 		         !mc_read_uint(mc, 2, &ref_count))
@@ -1494,7 +1507,7 @@ static BOOL parse_iref(struct MemCtx *mc, struct ObjData *d, ULONG iref_end)
 			 * IDs: a reference is a hint, and a wrong one is worse
 			 * than a missing one.
 			 */
-			MLOGV(LOG_WARN, "iref '%s': unexpected reference layout.", type);
+			MLOGV(LOG_INFO, "iref '%.4s': unexpected reference layout.", (STRPTR)type);
 		}
 		else
 		{
@@ -1896,6 +1909,7 @@ BOOL GetHeader(Class *cl, Object *obj)
 	UQUAD stream_length = MediaGetPort64(obj, 0, MMA_StreamLength);
 	UQUAD pos = 0, meta_start = 0;
 	UQUAD meta_size = 0;
+	ULONG meta_hdr = 8;     /* header bytes of the meta box: 8, or 16 when it has a largesize */
 	BOOL have_ftyp = FALSE;
 	struct ParsedProp props[AVIF_MAX_PROPERTIES];
 	ULONG num_props = 0;
@@ -1922,6 +1936,7 @@ BOOL GetHeader(Class *cl, Object *obj)
 		UBYTE hdr[16];
 		UQUAD box_size;
 		UBYTE box_type[4];
+		ULONG hdr_size;
 		ULONG avail = (stream_length - pos) > 16 ? 16 : (ULONG)(stream_length - pos);
 
 		if (DoMethod(obj, MMM_Seek, 0, MMM_SEEK_BYTES, &pos) != 1)
@@ -1935,18 +1950,20 @@ BOOL GetHeader(Class *cl, Object *obj)
 
 		box_size = be32(hdr);
 		memcpy(box_type, hdr + 4, 4);
+		hdr_size = 8;
 
 		if (box_size == 1)
 		{
 			if (avail < 16) break;
 			box_size = be64(hdr + 8);
+			hdr_size = 16;
 		}
 		else if (box_size == 0)
 		{
 			box_size = stream_length - pos;
 		}
 
-		if (box_size < 8 || box_size > stream_length - pos) break;
+		if (box_size < hdr_size || box_size > stream_length - pos) break;
 
 		if (!memcmp(box_type, "ftyp", 4))
 		{
@@ -1961,8 +1978,8 @@ BOOL GetHeader(Class *cl, Object *obj)
 				struct MemCtx mc_ftyp;
 
 				if (mc_init(&mc_ftyp, obj, pos, (ULONG)box_size) &&
-				    mc_seek(&mc_ftyp, 8) &&
-				    parse_ftyp(&mc_ftyp, (ULONG)box_size - 8))
+				    mc_seek(&mc_ftyp, hdr_size) &&
+				    parse_ftyp(&mc_ftyp, (ULONG)(box_size - hdr_size)))
 				{
 					have_ftyp = TRUE;
 				}
@@ -1973,6 +1990,7 @@ BOOL GetHeader(Class *cl, Object *obj)
 		{
 			meta_start = pos;
 			meta_size  = box_size;
+			meta_hdr   = hdr_size;
 		}
 
 		pos += box_size;
@@ -1995,7 +2013,7 @@ BOOL GetHeader(Class *cl, Object *obj)
 	if (meta_size > AVIF_MAX_META_SIZE)
 	{
 		seterr(MMERR_OUT_OF_MEMORY);
-		MLOG(LOG_ERRORS, "meta box too large (%Ld bytes).", meta_size);
+		MLOGV(LOG_ERRORS, "meta box too large (%Ld bytes).", meta_size);
 		return FALSE;
 	}
 
@@ -2006,8 +2024,9 @@ BOOL GetHeader(Class *cl, Object *obj)
 		return FALSE;
 	}
 
-	/* 'meta' is a FullBox: 4 bytes of version/flags precede the children */
-	if (!mc_skip(&mc_meta, 12))
+	/* 'meta' is a FullBox: 4 bytes of version/flags follow the box header,
+	   which is 8 bytes, or 16 when the box carried a 64 bit largesize */
+	if (!mc_skip(&mc_meta, meta_hdr + 4))
 	{
 		mc_free(&mc_meta);
 		seterr(MMERR_WRONG_DATA);
@@ -2023,6 +2042,7 @@ BOOL GetHeader(Class *cl, Object *obj)
 		UBYTE type[4];
 		UQUAD box_size, payload;
 		ULONG hdr_size, box_end;
+		ULONG box_pos = mc_tell(&mc_meta);
 		BOOL ok = TRUE;
 
 		if (!mc_read_box_header(&mc_meta, type, &box_size, &hdr_size, &payload))
@@ -2095,7 +2115,14 @@ BOOL GetHeader(Class *cl, Object *obj)
 
 		if (!ok)
 		{
-			MLOG(LOG_ERRORS, "Corrupt meta box.");
+			/*
+			 * Name the box that failed: a malformed meta box is otherwise
+			 * a dead end for whoever has to work out why the file is
+			 * rejected, and the four character type is the only clue
+			 * the parser has at this point.
+			 */
+			MLOGV(LOG_ERRORS, "Corrupt meta box (%.4s at offset %ld).",
+			      (STRPTR)type, (LONG)box_pos);
 			mc_free(&mc_meta);
 			seterr(MMERR_WRONG_DATA);
 			free_header_data(pd);
@@ -2125,7 +2152,7 @@ BOOL GetHeader(Class *cl, Object *obj)
 		if (!item || !item->id_IsAv01)
 		{
 			seterr(MMERR_WRONG_DATA);
-			MLOG(LOG_ERRORS, "Primary item %lu is missing or not AV1.",
+			MLOGV(LOG_ERRORS, "Primary item %lu is missing or not AV1.",
 			      (ULONG)pd->od_PrimaryItemID);
 			mc_free(&mc_meta);
 			free_header_data(pd);
@@ -2247,7 +2274,7 @@ BOOL GetHeader(Class *cl, Object *obj)
 		if (!ait || !ait->id_HasLocation)
 		{
 			seterr(MMERR_WRONG_DATA);
-			MLOG(LOG_ERRORS, "Alpha item %lu has no location.",
+			MLOGV(LOG_ERRORS, "Alpha item %lu has no location.",
 			      (ULONG)pd->od_AlphaItemID);
 			free_header_data(pd);
 			return FALSE;
@@ -2353,7 +2380,7 @@ LONG New(Class *cl, Object *obj, struct opSet *msg)
 	}
 
 	if (!newobj) CoerceMethod(cl, obj, (Msg)OM_DISPOSE);
-	else MLOGV(LOG_INFO, "Object created.");
+	else MLOG(LOG_INFO, "Object created.");
 
 	return newobj;
 }
@@ -2371,7 +2398,7 @@ LONG Dispose(Class *cl, Object *obj, Msg msg)
 	if (d->od_AlphaES) MediaFreeVec(d->od_AlphaES);
 	if (d->od_Info) MediaFreeVec(d->od_Info);
 
-	MLOGV(LOG_INFO, "Object disposed.");
+	MLOG(LOG_INFO, "Object disposed.");
 
 	DoMethod(obj, MMM_UnlockObject);
 	return DoSuperMethodA(cl, obj, msg);

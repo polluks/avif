@@ -6,9 +6,12 @@
 # This Makefile is invoked from the parent avif_decoder Makefile, or directly.
 
 CC ?= gcc
-CFLAGS ?= -O2 -fomit-frame-pointer
+# -DNDEBUG compiles out dav1d's internal assertions, the way upstream release
+# builds do: a damaged stream must return an error, never abort the plugin.
+# The parent avif_decoder Makefile passes the same flag down through CFLAGS.
+CFLAGS ?= -O2 -fomit-frame-pointer -DNDEBUG
 # MorphOS cross build: override above on the command line, e.g.
-#   make CC=ppc-morphos-gcc CFLAGS="-noixemul -nostartfiles -O2 -mcpu=604e -fomit-frame-pointer"
+#   make CC=ppc-morphos-gcc CFLAGS="-noixemul -nostartfiles -O2 -mcpu=604e -fomit-frame-pointer -DNDEBUG"
 
 ARCH_CFLAGS = -DHAVE_ASM=0
 # Host (little-endian x86) test builds must override endianness:

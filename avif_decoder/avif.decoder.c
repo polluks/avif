@@ -150,7 +150,7 @@ static const struct TagItem RTags[] =
 	{QUERYINFOATTR_IDSTRING, (ULONG)&VTag[1]},
 	{QUERYINFOATTR_DESCRIPTION, (ULONG)"AVIF fileformat decoder"},
 	{QUERYINFOATTR_COPYRIGHT, (ULONG)"(c) 2026"},
-	{QUERYINFOATTR_AUTHOR, (ULONG)"Reggae contributors"},
+	{QUERYINFOATTR_AUTHOR, (ULONG)"Big Pickle"},
 	{QUERYINFOATTR_DATE, (ULONG)DATE},
 	{QUERYINFOATTR_VERSION, VERSION},
 	{QUERYINFOATTR_REVISION, REVISION},
@@ -420,23 +420,17 @@ BOOL LoadData(Class *cl, Object *obj)
 	if (d->od_Loaded) return TRUE;
 
 	/*
-	 * The AvifInfo pointer travels as an attribute value, so it has to be
-	 * fetched through storage: MediaGetPortFwd() hands the value back in
-	 * the return register, which is 32 bit on MorphOS and cannot carry a
-	 * pointer.  It is also a varargs call, so the storage pointer has to
-	 * be passed even when only the value is wanted.
+	 * The AvifInfo pointer travels as an attribute value, which is what
+	 * MMA_ExtraData is for: the demuxer hands over a pointer to a structure
+	 * that lives as long as its own object does, and a demuxer->decoder pipe
+	 * outlives the individual frames.  The value comes back in the return
+	 * register, which is 32 bit wide on MorphOS, just like a pointer.
 	 */
-	ULONG info_ptr = 0;
-
-	if (!MediaGetPortFwd(obj, 0, MMA_ExtraData, &info_ptr))
-	{
-		MLOG(LOG_ERRORS, "No AvifInfo from input port.");
-		return FALSE;
-	}
-	info = (struct AvifInfo*)(APTR)info_ptr;
+	info = (struct AvifInfo*)(APTR)MediaGetPortFwd(obj, 0, MMA_ExtraData);
 	if (!info)
 	{
 		MLOG(LOG_ERRORS, "No AvifInfo from input port.");
+		seterr(MMERR_NO_STREAM);
 		return FALSE;
 	}
 
@@ -453,8 +447,9 @@ BOOL LoadData(Class *cl, Object *obj)
 	if (d->od_Width == 0 || d->od_Height == 0 ||
 	    d->od_Width >= 0x10000 || d->od_Height >= 0x10000)
 	{
-		MLOG(LOG_ERRORS, "Invalid dimensions %lu x %lu.",
-		     d->od_Width, d->od_Height);
+		MLOGV(LOG_ERRORS, "Invalid dimensions %lu x %lu.",
+		      d->od_Width, d->od_Height);
+		seterr(MMERR_WRONG_DATA);
 		return FALSE;
 	}
 
@@ -464,6 +459,7 @@ BOOL LoadData(Class *cl, Object *obj)
 	if (!es_len || !info->ai_ES)
 	{
 		MLOG(LOG_ERRORS, "Empty elementary stream.");
+		seterr(MMERR_WRONG_DATA);
 		return FALSE;
 	}
 
@@ -475,6 +471,7 @@ BOOL LoadData(Class *cl, Object *obj)
 	if (!d->od_ES)
 	{
 		MLOG(LOG_ERRORS, "Out of memory for elementary stream.");
+		seterr(MMERR_OUT_OF_MEMORY);
 		return FALSE;
 	}
 	memcpy(d->od_ES, info->ai_ES, es_len);
@@ -489,6 +486,7 @@ BOOL LoadData(Class *cl, Object *obj)
 			MediaFreeVec(d->od_ES);
 			d->od_ES = NULL;
 			d->od_ESLength = 0;
+			seterr(MMERR_OUT_OF_MEMORY);
 			return FALSE;
 		}
 		memcpy(d->od_AlphaES, info->ai_AlphaES, alpha_len);
@@ -907,7 +905,7 @@ static BOOL decode_one_stream(const UBYTE *es, ULONG len,
 
 	if (dav1d_open(&ctx, &s) != 0)
 	{
-		MLOGV(LOG_ERRORS, "Unable to open dav1d decoder.");
+		MLOG(LOG_ERRORS, "Unable to open dav1d decoder.");
 		return FALSE;
 	}
 
@@ -924,13 +922,24 @@ static BOOL decode_one_stream(const UBYTE *es, ULONG len,
 	 * wants the frame that follows.  Flushing with an empty Dav1dData then
 	 * tells it no more data is coming, which is what lets the pending frame
 	 * be decoded.
+	 *
+	 * dav1d only takes the reference over when it consumes the packet and
+	 * answers zero.  On EAGAIN and on an error the packet is still ours and
+	 * has to be released here, or it outlives the context it belongs to.
 	 */
 	res = dav1d_send_data(ctx, &data);
-	if (res != 0 && res != DAV1D_ERR(EAGAIN))
+	if (res != 0)
 	{
-		MLOGV(LOG_ERRORS, "dav1d_send_data failed (%d).", res);
-		dav1d_close(&ctx);
-		return FALSE;
+		if (res != DAV1D_ERR(EAGAIN))
+		{
+			MLOGV(LOG_ERRORS, "dav1d_send_data failed (%d).", res);
+			dav1d_data_unref(&data);
+			dav1d_close(&ctx);
+			return FALSE;
+		}
+
+		/* the stream stops short of what dav1d asks for, so give up on it */
+		dav1d_data_unref(&data);
 	}
 
 	memset(&data, 0, sizeof(data));
@@ -938,10 +947,17 @@ static BOOL decode_one_stream(const UBYTE *es, ULONG len,
 	if (res != 0 && res != DAV1D_ERR(EAGAIN))
 	{
 		MLOGV(LOG_ERRORS, "dav1d_send_data flush failed (%d).", res);
+		dav1d_data_unref(&data);
 		dav1d_close(&ctx);
 		return FALSE;
 	}
 
+	/*
+	 * dav1d_get_picture() moves a picture reference into the caller's
+	 * structure and asserts that the destination is empty, so both pictures
+	 * have to start out zeroed.
+	 */
+	memset(out, 0, sizeof(*out));
 	res = dav1d_get_picture(ctx, out);
 	if (res == 0)
 	{
@@ -961,17 +977,24 @@ static BOOL decode_one_stream(const UBYTE *es, ULONG len,
 static BOOL DecodeOneFrame(Class *cl, Object *obj)
 {
 	GET_DATA;
-	Dav1dPicture pic;
-	Dav1dPicture apic;
+	Dav1dPicture pic, apic;
 	Dav1dContext *ctx = NULL;
 	Dav1dContext *actx = NULL;
 	BOOL have_alpha = FALSE;
 	BOOL ok = FALSE;
 	ULONG bitmap_bytes;
 
+	/* both pictures are filled by dav1d_get_picture(), which wants them empty */
+	memset(&pic, 0, sizeof(pic));
+	memset(&apic, 0, sizeof(apic));
+
 	if (d->od_DecodeDone) return TRUE;
 
-	if (!decode_one_stream(d->od_ES, d->od_ESLength, &ctx, &pic)) return FALSE;
+	if (!decode_one_stream(d->od_ES, d->od_ESLength, &ctx, &pic))
+	{
+		seterr(MMERR_WRONG_DATA);
+		return FALSE;
+	}
 
 	if (d->od_AlphaES && d->od_AlphaESLength)
 	{
@@ -983,7 +1006,7 @@ static BOOL DecodeOneFrame(Class *cl, Object *obj)
 			 * A missing alpha plane is not fatal: fall back to an
 			 * opaque image rather than failing the whole decode.
 			 */
-			MLOGV(LOG_WARN, "Alpha stream did not decode, using opaque.");
+			MLOG(LOG_INFO, "Alpha stream did not decode, using opaque.");
 		}
 	}
 
@@ -995,6 +1018,7 @@ static BOOL DecodeOneFrame(Class *cl, Object *obj)
 	if (d->od_Width > 0x1FFFFFFFUL / d->od_Height)
 	{
 		MLOG(LOG_ERRORS, "Bitmap size overflow.");
+		seterr(MMERR_WRONG_DATA);
 		goto cleanup;
 	}
 
@@ -1004,6 +1028,7 @@ static BOOL DecodeOneFrame(Class *cl, Object *obj)
 	if (!d->od_Bitmap)
 	{
 		MLOG(LOG_ERRORS, "Out of memory for bitmap.");
+		seterr(MMERR_OUT_OF_MEMORY);
 		goto cleanup;
 	}
 	d->od_BitmapBytes = bitmap_bytes;
@@ -1013,6 +1038,7 @@ static BOOL DecodeOneFrame(Class *cl, Object *obj)
 		MediaFreeVec(d->od_Bitmap);
 		d->od_Bitmap = NULL;
 		d->od_BitmapBytes = 0;
+		seterr(MMERR_WRONG_DATA);
 		goto cleanup;
 	}
 

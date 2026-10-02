@@ -3,6 +3,10 @@
 CC = ppc-morphos-gcc
 CFLAGS = -noixemul -nostartfiles -O2 -fomit-frame-pointer -mcpu=604e -mmultiple
 CFLAGS += -W -Wall -Wno-parentheses
+# A damaged file must not be able to abort the whole plugin, and dav1d's
+# assertions are development aids rather than part of the decoder, so they
+# are compiled out here the way upstream release builds do.
+CFLAGS += -DNDEBUG
 LD = ppc-morphos-gcc
 LDFLAGS = -nostartfiles -noixemul
 LIBS = -labox -lm -lmath -lpthread
